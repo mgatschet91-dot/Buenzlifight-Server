@@ -1,0 +1,72 @@
+-- Büenzli-typische Events: Alltägliche Ordnungs-Verstösse die der Büenzli auf seiner Runde findet
+-- Alle: Kategorie 'ordnung', niedrige Severity, hohe spawn_weight
+
+INSERT IGNORE INTO event_types (code, name, description, emoji, category, severity, min_level,
+  base_confidence, duration_hours_min, duration_hours_max,
+  xp_reward_report, xp_reward_fix, xp_penalty_wrong,
+  fix_cost_min, fix_cost_max, stat_impact, stat_damage, stat_fix_bonus,
+  spawn_weight, is_active)
+VALUES
+  ('illegal_parking', 'Falschparkieren',
+   'Ein Fahrzeug blockiert den Verkehr. Muss abgeschleppt werden.',
+   '🚗', 'ordnung', 1, 1,
+   0.95, 2, 6,
+   5, 8, -3,
+   50, 150, 'cleanliness', -2, 1,
+   15, 1),
+
+  ('dog_unleashed', 'Hund ohne Leine',
+   'Ein Hund laeuft ohne Leine in einer Leinenpflicht-Zone. Halter muss ermahnt werden.',
+   '🐕', 'ordnung', 1, 1,
+   0.90, 1, 4,
+   3, 5, -2,
+   30, 80, 'cleanliness', -1, 1,
+   18, 1),
+
+  ('sunday_noise', 'Sonntagsruhe verletzt',
+   'Laermende Taetigkeit waehrend der Sonntagsruhe. Polizeiverordnung §8.',
+   '🔕', 'ordnung', 1, 1,
+   0.85, 2, 8,
+   4, 6, -2,
+   40, 120, 'cleanliness', -2, 1,
+   14, 1),
+
+  ('lawn_overgrown', 'Rasen verwildert',
+   'Der Rasen eines Grundstuecks ist stark ueberwachsen. Gartenordnung §12.',
+   '🌾', 'ordnung', 1, 1,
+   0.95, 4, 12,
+   3, 5, -2,
+   20, 60, 'cleanliness', -1, 1,
+   16, 1),
+
+  ('recycling_violation', 'Falsche Muelltrennung',
+   'Abfall wurde in die falsche Tonne geworfen. Recycling-Reglement §3.',
+   '♻️', 'ordnung', 1, 1,
+   0.90, 2, 6,
+   3, 5, -2,
+   25, 70, 'cleanliness', -2, 1,
+   17, 1),
+
+  ('fence_too_high', 'Zaunhoehe ueberschritten',
+   'Ein Zaun ueberschreitet die zulaessige Hoehe von 1.20m. Bauordnung §14.',
+   '🧱', 'ordnung', 1, 1,
+   0.95, 6, 24,
+   4, 6, -2,
+   60, 200, 'cleanliness', -1, 1,
+   10, 1),
+
+  ('laundry_sunday', 'Waesche am Sonntag',
+   'Waesche wurde am Sonntag draussen aufgehaengt. Ruhetagsordnung §2.',
+   '👕', 'ordnung', 1, 1,
+   0.80, 1, 3,
+   2, 4, -1,
+   20, 50, 'cleanliness', -1, 1,
+   12, 1),
+
+  ('bbq_smoke', 'Grillrauch-Belaestigung',
+   'Starker Grillrauch belaestigt die Nachbarschaft. Immissionsschutz §3.',
+   '🍖', 'ordnung', 1, 1,
+   0.85, 1, 4,
+   3, 5, -2,
+   30, 90, 'cleanliness', -1, 1,
+   14, 1);

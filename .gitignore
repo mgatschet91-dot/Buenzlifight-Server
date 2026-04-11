@@ -1,0 +1,66 @@
+# ── Node / NPM ────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp
+.pnp.js
+
+# ── Next.js ───────────────────────────────────────────────
+.next/
+out/
+build/
+dist/
+
+# ── Umgebungsvariablen & Secrets (NIEMALS committen!) ─────
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*
+server-core/config.cfg
+
+# ── Logs ─────────────────────────────────────────────────
+*.log
+logs/
+pids/
+*.pid
+
+# ── OS ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ──────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Archive & Backups (nicht ins Repo) ───────────────────
+*.rar
+*.zip
+*.tar.gz
+*.7z
+ISOMETRIC.old/
+bobba-room/
+bobba_client-master/
+bobba_server-master/
+lpc-generator/
+sprite-tool/
+ragezone.html
+nul
+"Projekt Original Files (Nicht bearbeiten)/"
+"buenzlifight Client Server 27.02.2026/"
+"Furnis Packs/"
+"meinort 17.02.rar"
+
+# ── Electron Build Output ─────────────────────────────────
+electron-app/dist/
+electron-app/node_modules/
+
+# ── Temporäre Dateien ────────────────────────────────────
+*.tmp
+*.temp
+.cache/

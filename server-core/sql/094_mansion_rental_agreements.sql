@@ -1,0 +1,22 @@
+CREATE TABLE mansion_rental_agreements (
+  id              BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  municipality_id BIGINT UNSIGNED NOT NULL,
+  room_code       VARCHAR(10) NOT NULL,
+  tile_x          INT NOT NULL,
+  tile_y          INT NOT NULL,
+  owner_id        BIGINT UNSIGNED NOT NULL,
+  tenant_id       BIGINT UNSIGNED NOT NULL,
+  monthly_rent    INT UNSIGNED NOT NULL,
+  tax_rate        TINYINT UNSIGNED NOT NULL DEFAULT 15,
+  status          ENUM('active','cancelled') NOT NULL DEFAULT 'active',
+  started_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_paid_at    DATETIME NULL,
+  next_due_at     DATETIME NOT NULL,
+  missed_payments TINYINT UNSIGNED NOT NULL DEFAULT 0,
+  UNIQUE KEY uq_tenant_muni (tenant_id, municipality_id),
+  KEY idx_due (next_due_at, status),
+  KEY idx_mansion (municipality_id, room_code, tile_x, tile_y),
+  FOREIGN KEY (owner_id) REFERENCES users(id),
+  FOREIGN KEY (tenant_id) REFERENCES users(id),
+  FOREIGN KEY (municipality_id) REFERENCES municipalities(id)
+) ENGINE=InnoDB;

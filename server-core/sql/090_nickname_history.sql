@@ -1,0 +1,8 @@
+CREATE TABLE nickname_history (
+  id         BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  user_id    BIGINT UNSIGNED NOT NULL,
+  old_nickname VARCHAR(64) NOT NULL,
+  changed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_nh_user (user_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
