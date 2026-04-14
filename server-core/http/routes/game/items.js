@@ -17,6 +17,8 @@ const {
   syncRoomItems,
 } = require('../../../game/rooms');
 
+const { invalidateRoomItemsCache } = require('../../../jobs/intervals');
+
 const {
   formatGameItemRow,
 } = require('../../../game/building');
@@ -133,6 +135,7 @@ module.exports = function registerItemsRoutes(deps) {
           return sendJson(res, 403, { ok: false, error: 'Beobachter dürfen die Map nicht verändern' });
         }
         const deleted = await deleteRoomItems(municipality.id, roomCode);
+        invalidateRoomItemsCache(municipality.id, roomCode);
         await refreshGameDataMapFromItems(municipality, roomCode, 'server-core-live-v1');
         return sendJson(res, 200, { ok: true, data: { deleted } });
       }
@@ -165,6 +168,7 @@ module.exports = function registerItemsRoutes(deps) {
         authUser.id,
         items
       );
+      invalidateRoomItemsCache(municipality.id, roomCode);
       await refreshGameDataMapFromItems(municipality, roomCode, 'server-core-live-v1');
       return sendJson(res, 200, {
         ok: true,
@@ -191,6 +195,7 @@ module.exports = function registerItemsRoutes(deps) {
       }
 
       const deleted = await deleteRoomItems(municipality.id, roomCode);
+      invalidateRoomItemsCache(municipality.id, roomCode);
       const generated = await ensureServerGeneratedRoomMap(municipality, roomCode);
       const version = await getRoomItemVersion(municipality.id, roomCode);
       const rows = await getRoomItemRows(municipality.id, roomCode);
@@ -241,6 +246,7 @@ module.exports = function registerItemsRoutes(deps) {
         authUser.id,
         items
       );
+      invalidateRoomItemsCache(municipality.id, roomCode);
       await refreshGameDataMapFromItems(municipality, roomCode, 'server-core-live-v1');
       return sendJson(res, 200, { ok: true, data: result });
     }
@@ -324,6 +330,7 @@ module.exports = function registerItemsRoutes(deps) {
       }
       const roomCode = normalizeRoomCode(legacyItemsGetMatch[2]);
       const deleted = await deleteRoomItems(municipality.id, roomCode);
+      invalidateRoomItemsCache(municipality.id, roomCode);
       await refreshGameDataMapFromItems(municipality, roomCode, 'server-core-live-v1');
       return sendJson(res, 200, { success: true, data: { deleted } });
     }
@@ -347,6 +354,7 @@ module.exports = function registerItemsRoutes(deps) {
       const items = Array.isArray(body.items) ? body.items : null;
       if (!roomCode || !items) return sendJson(res, 422, { success: false, error: 'room_code/items ungültig' });
       const result = await importRoomItems(municipality.id, roomCode, (body.client_id || 'system').toString(), authUser.id, items);
+      invalidateRoomItemsCache(municipality.id, roomCode);
       await refreshGameDataMapFromItems(municipality, roomCode, 'server-core-live-v1');
       return sendJson(res, 200, {
         success: true,
@@ -371,6 +379,7 @@ module.exports = function registerItemsRoutes(deps) {
       }
 
       const deleted = await deleteRoomItems(municipality.id, roomCode);
+      invalidateRoomItemsCache(municipality.id, roomCode);
       const generated = await ensureServerGeneratedRoomMap(municipality, roomCode);
       const version = await getRoomItemVersion(municipality.id, roomCode);
       const rows = await getRoomItemRows(municipality.id, roomCode);
@@ -412,6 +421,7 @@ module.exports = function registerItemsRoutes(deps) {
       const items = Array.isArray(body.items) ? body.items : null;
       if (!roomCode || !items) return sendJson(res, 422, { success: false, error: 'room_code/items ungültig' });
       const result = await syncRoomItems(municipality.id, roomCode, (body.client_id || 'system').toString(), authUser.id, items);
+      invalidateRoomItemsCache(municipality.id, roomCode);
       await refreshGameDataMapFromItems(municipality, roomCode, 'server-core-live-v1');
       return sendJson(res, 200, { success: true, data: result });
     }

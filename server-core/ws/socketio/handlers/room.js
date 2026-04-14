@@ -452,10 +452,11 @@ module.exports = function registerRoomHandlers(socket, io, context) {
     if (!municipalityId) return;
     try {
       const { tileX, tileY, slot, color } = data;
+      const leaveAfter = Math.floor(60 + Math.random() * 240); // 1-5 min
       const { dbPool } = require('../../../infra/db');
       await dbPool.query(
-        'INSERT IGNORE INTO parked_vehicles (municipality_id, tile_x, tile_y, slot, color) VALUES (?, ?, ?, ?, ?)',
-        [municipalityId, tileX, tileY, slot, color]
+        'INSERT IGNORE INTO parked_vehicles (municipality_id, tile_x, tile_y, slot, color, leave_after_seconds) VALUES (?, ?, ?, ?, ?, ?)',
+        [municipalityId, tileX, tileY, slot, color, leaveAfter]
       );
       // Gebühr prüfen / Schwarzparker erfassen
       const { handleVehicleParked } = require('../../../game/parkingSystem');

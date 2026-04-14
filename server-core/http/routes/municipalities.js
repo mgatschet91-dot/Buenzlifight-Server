@@ -48,6 +48,8 @@ module.exports = function registerMunicipalityRoutes(deps) {
 
     // GET /api/municipalities
     if (req.method === 'GET' && pathname === '/api/municipalities') {
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
       const municipalities = await fetchMunicipalities();
       return sendJson(res, 200, { ok: true, municipalities, member_limit: MUNICIPALITY_MEMBER_LIMIT });
     }
@@ -230,6 +232,8 @@ module.exports = function registerMunicipalityRoutes(deps) {
     // GET /api/game/municipality/:slug/map
     const municipalityMapMatch = pathname.match(/^\/api\/game\/municipality\/([a-z0-9-]+)\/map$/i);
     if (req.method === 'GET' && municipalityMapMatch) {
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { success: false, error: 'Nicht authentifiziert' });
       const slug = municipalityMapMatch[1].toLowerCase();
       const municipality = await getMunicipalityBySlug(slug);
       if (!municipality) return sendJson(res, 404, { success: false, error: 'Gemeinde nicht gefunden' });
@@ -507,6 +511,8 @@ module.exports = function registerMunicipalityRoutes(deps) {
     const zoneSettingsGetMatch = pathname.match(/^\/api\/game\/municipality\/([a-z0-9-]+)\/zone-settings$/i);
     if (zoneSettingsGetMatch && req.method === 'GET') {
       ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
       const municipality = await getMunicipalityBySlug(zoneSettingsGetMatch[1].toLowerCase());
       if (!municipality) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
 

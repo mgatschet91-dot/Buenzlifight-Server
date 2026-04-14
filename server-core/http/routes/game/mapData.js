@@ -38,6 +38,8 @@ module.exports = function registerMapDataRoutes(/* deps */) {
     // ── Game-data rivers ───────────────────────────────────────
     if (req.method === 'GET' && pathname === '/api/game-data/rivers') {
       ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
       const cantonQuery = requestUrl.searchParams.get('canton');
       const municipalitySlugQuery = requestUrl.searchParams.get('municipality_slug');
       let canton = cantonQuery || null;
@@ -96,6 +98,8 @@ module.exports = function registerMapDataRoutes(/* deps */) {
       }
 
       if (req.method === 'GET') {
+        const authUser = await getAuthenticatedUser(req);
+        if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
         const row = await getGameMapForMunicipality(municipality.id);
         if (!row) {
           return sendJson(res, 200, {

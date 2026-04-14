@@ -1,6 +1,7 @@
 'use strict';
 
 const { sendJson } = require('../../../infra/http');
+const { getAuthenticatedUser } = require('../../../auth/middleware');
 
 const {
   fetchItemDetails,
@@ -44,6 +45,8 @@ module.exports = function registerBuildingTypesRoutes(/* deps */) {
     // ── Canton ──────────────────────────────────────────────────
     const cantonMatch = pathname.match(/^\/api\/game\/canton\/([a-z]{2})$/i);
     if (req.method === 'GET' && cantonMatch) {
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { success: false, error: 'Nicht authentifiziert' });
       const cantonCode = cantonMatch[1].toUpperCase();
       const municipalities = await fetchCantonMunicipalities(cantonCode);
       if (municipalities.length === 0) {
@@ -83,6 +86,8 @@ module.exports = function registerBuildingTypesRoutes(/* deps */) {
 
     // ── Switzerland ─────────────────────────────────────────────
     if (req.method === 'GET' && pathname === '/api/game/switzerland') {
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { success: false, error: 'Nicht authentifiziert' });
       const municipalities = await fetchMunicipalities();
       const byCanton = new Map();
       for (const m of municipalities) {

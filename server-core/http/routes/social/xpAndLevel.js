@@ -49,6 +49,8 @@ module.exports = function registerXpAndLevelRoutes(deps) {
 
     if (req.method === 'GET' && pathname === '/api/xp/leaderboard') {
       ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
       const limit = Math.min(50, Math.max(1, Number(requestUrl.searchParams.get('limit')) || 20));
       const [rows] = await dbPool.query(
         `SELECT ux.user_id, u.nickname, ux.total_xp, ux.level, ux.login_streak

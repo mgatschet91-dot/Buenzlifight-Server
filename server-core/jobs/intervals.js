@@ -3,6 +3,28 @@
 const { logInfo, logError } = require('../infra/logger.js');
 const { BUENZLI_EVENT_CHECK_INTERVAL_MS, ROOM_CACHE_FLUSH_INTERVAL_MS } = require('../config/constants.js');
 
+// ── Room-Items-Cache ─────────────────────────────────────────────────────────
+// Verhindert, dass jede 3s-Tick-Runde alle game_items neu aus der DB lädt.
+// TTL: 10 Sekunden. Invalidierung via invalidateRoomItemsCache() bei Mutation.
+const _roomItemsCache = new Map(); // `${municipalityId}:${roomCode}` → { rows, cachedAt }
+const ROOM_ITEMS_CACHE_TTL_MS = 10_000;
+
+async function _getCachedRoomItems(rooms, municipalityId, roomCode) {
+  const key = `${municipalityId}:${roomCode}`;
+  const cached = _roomItemsCache.get(key);
+  if (cached && (Date.now() - cached.cachedAt) < ROOM_ITEMS_CACHE_TTL_MS) {
+    return cached.rows;
+  }
+  const rows = await rooms.getRoomItemRows(municipalityId, roomCode);
+  _roomItemsCache.set(key, { rows, cachedAt: Date.now() });
+  return rows;
+}
+
+// Wird von Route-Handlern aufgerufen, wenn Gebäude platziert/entfernt werden
+function invalidateRoomItemsCache(municipalityId, roomCode) {
+  _roomItemsCache.delete(`${municipalityId}:${roomCode}`);
+}
+
 function registerIntervals(deps) {
   const intervals = [];
 
@@ -132,8 +154,8 @@ function registerIntervals(deps) {
 
         try {
           const roomKey = wsHelpers.wsRoomKey(municipalitySlug, roomCode);
-          // Items 1x laden und an alle Tick-Funktionen weitergeben (Performance)
-          const sharedRows = await rooms.getRoomItemRows(municipalityId, roomCode);
+          // Items gecacht laden (10s TTL) – verhindert DB-Roundtrip jede 3s
+          const sharedRows = await _getCachedRoomItems(rooms, municipalityId, roomCode);
           // Crime-Count vom letzten Tick übergeben (für Happiness-Berechnung)
           const rawStats = await stats.recomputeAuthoritativePopulationAndJobs(municipalityId, roomCode, sharedRows, { crimeCount: entry._lastCrimeCount || 0 });
           // LandValue-Grid + Service-Grids aus stats an Upgrade-Tick weitergeben
@@ -183,6 +205,8 @@ function registerIntervals(deps) {
               ...(woodcutterResult?.changes || []),
             ];
             if (buildingChanges.length > 0) {
+              // Server hat game_items geändert → Cache invalidieren
+              invalidateRoomItemsCache(municipalityId, roomCode);
               io.to(roomKey).emit('buildings-authoritative', {
                 changes: buildingChanges,
                 serverTimestamp: Date.now(),
@@ -609,23 +633,33 @@ function registerIntervals(deps) {
     }
   }, 10 * 60 * 1000)); // alle 10 Minuten
 
-  // 16) Parkraum-Kontrolleur-Tick (alle 30s): Schwarzparker büssen
-  // Einnahmen werden NICHT per Tick berechnet — Gebühr fällt beim Wegfahren an (leave-parking Event).
+  // 16) Parkraum-Ticks
   const getParkingSystem = () => require('../game/parkingSystem');
+  const buildBroadcastToRoom = () => {
+    const wsIo = deps?.io;
+    const { wsRoomMetadata } = require('../ws/socketio/index');
+    return (municipalityId, event, data) => {
+      if (!wsIo) return;
+      for (const [roomKey, meta] of wsRoomMetadata.entries()) {
+        if (Number(meta.municipalityId) === Number(municipalityId)) {
+          wsIo.to(roomKey).emit(event, data);
+          break;
+        }
+      }
+    };
+  };
+  // 16a) Ablauf-Tick: Abgelaufene Fahrzeuge rauswerfen (alle 60s)
   intervals.push(setInterval(async () => {
     try {
-      const { io: wsIo } = require('../ws/socketio/index');
-      const { wsRoomMetadata } = require('../ws/socketio/helpers');
-      // broadcastToRoom: findet den roomKey für eine municipalityId und sendet
-      const broadcastToRoom = (municipalityId, event, data) => {
-        for (const [roomKey, meta] of wsRoomMetadata.entries()) {
-          if (Number(meta.municipalityId) === Number(municipalityId)) {
-            wsIo.to(roomKey).emit(event, data);
-            break;
-          }
-        }
-      };
-      await getParkingSystem().runParkingControlTick(broadcastToRoom);
+      await getParkingSystem().runParkingExpiryTick(buildBroadcastToRoom());
+    } catch (err) {
+      logError('INTERVAL', 'Parkraum-Ablauf-Tick Fehler', { error: err?.message });
+    }
+  }, 60000)); // alle 60 Sekunden
+  // 16b) Kontrolleur-Tick: Schwarzparker büssen (alle 30s)
+  intervals.push(setInterval(async () => {
+    try {
+      await getParkingSystem().runParkingControlTick(buildBroadcastToRoom());
     } catch (err) {
       logError('INTERVAL', 'Parkraum-Kontrolleur-Tick Fehler', { error: err?.message });
     }
@@ -635,4 +669,4 @@ function registerIntervals(deps) {
   return intervals;
 }
 
-module.exports = { registerIntervals };
+module.exports = { registerIntervals, invalidateRoomItemsCache };

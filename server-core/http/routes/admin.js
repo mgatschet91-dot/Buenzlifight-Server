@@ -151,11 +151,16 @@ module.exports = function registerAdminRoutes(deps) {
       const authUser = await getAuthenticatedUser(req);
       if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
       if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+      const q = requestUrl.searchParams.get('q') || '';
+      const params = [];
+      let where = '1=1';
+      if (q) { where += ` AND m.name LIKE ?`; params.push(`%${escapeLike(q)}%`); }
+      params.push(200);
       const [rows] = await dbPool.query(
         `SELECT m.id, m.name, m.slug, m.canton_code, COALESCE(mc.cnt, 0) AS members_count
          FROM municipalities m
-         LEFT JOIN (SELECT municipality_id, COUNT(*) AS cnt FROM users WHERE is_active = 1 GROUP BY municipality_id) mc ON mc.municipality_id = m.id
-         WHERE m.is_active = 1 ORDER BY m.name ASC`);
+         LEFT JOIN (SELECT municipality_id, COUNT(*) AS cnt FROM users GROUP BY municipality_id) mc ON mc.municipality_id = m.id
+         WHERE ${where} ORDER BY m.name ASC LIMIT ?`, params);
       return sendJson(res, 200, { ok: true, data: { municipalities: rows } });
     }
 
@@ -767,6 +772,261 @@ module.exports = function registerAdminRoutes(deps) {
         [userId, xp, level]
       );
       return sendJson(res, 200, { ok: true, data: { xp, level } });
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // LIVE-SESSIONS
+    // ══════════════════════════════════════════════════════════════
+    if (req.method === 'GET' && pathname === '/api/admin/sessions') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+      const { wsRoomPlayers: roomPlayers, wsRoomMetadata, wsUserSockets: userSockets } = require('../../ws/socketio/index');
+      const io = deps?.io;
+      const sessions = [];
+      for (const [roomKey, players] of roomPlayers.entries()) {
+        const meta = wsRoomMetadata?.get(roomKey);
+        for (const [, pdata] of players.entries()) {
+          const sock = io?.sockets?.sockets?.get(pdata.socketId);
+          sessions.push({
+            userId: pdata.userId || null,
+            nickname: pdata.nickname || pdata.name || null,
+            socketId: pdata.socketId,
+            roomKey,
+            municipalitySlug: meta?.municipalitySlug || null,
+            municipalityName: meta?.municipalityName || null,
+            roomCode: meta?.roomCode || null,
+            connectedSince: sock?.handshake?.time || null,
+          });
+        }
+      }
+      // Online-User-Count aus DB
+      const [onlineRows] = await dbPool.query(
+        `SELECT u.id, u.nickname, u.last_online_at FROM users u WHERE u.is_online = 1 ORDER BY u.last_online_at DESC LIMIT 100`
+      );
+      return sendJson(res, 200, { ok: true, data: { sessions, onlineDb: onlineRows, total: sessions.length } });
+    }
+
+    // Kick einzelne Session
+    const adminKickMatch = pathname.match(/^\/api\/admin\/sessions\/kick$/i);
+    if (adminKickMatch && req.method === 'POST') {
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+      const body = await readJsonBody(req);
+      const { socketId } = body;
+      const io = deps?.io;
+      const sock = io?.sockets?.sockets?.get(socketId);
+      if (sock) {
+        sock.emit('force-disconnect', { reason: 'Admin-Kick' });
+        sock.disconnect(true);
+      }
+      return sendJson(res, 200, { ok: true, data: { kicked: !!sock } });
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // TRANSAKTIONEN
+    // ══════════════════════════════════════════════════════════════
+    if (req.method === 'GET' && pathname === '/api/admin/transactions') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+      const limit = Math.min(Number(requestUrl.searchParams.get('limit') || 100), 500);
+      const typeFilter = requestUrl.searchParams.get('type') || '';
+      const minAmount = Number(requestUrl.searchParams.get('min') || 0);
+      let sql = `
+        SELECT bt.id, uba.user_id, bt.type, bt.direction, bt.amount, bt.balance_after,
+               bt.description, bt.reference, bt.created_at,
+               u.nickname
+        FROM bank_transactions bt
+        LEFT JOIN user_bank_accounts uba ON uba.id = bt.account_id
+        LEFT JOIN users u ON u.id = uba.user_id
+        WHERE ABS(bt.amount) >= ?
+      `;
+      const params = [minAmount];
+      if (typeFilter) { sql += ` AND bt.type = ?`; params.push(typeFilter); }
+      sql += ` ORDER BY bt.created_at DESC LIMIT ?`;
+      params.push(limit);
+      const [rows] = await dbPool.query(sql, params);
+      // Distinct types für Filter-Dropdown
+      const [types] = await dbPool.query(`SELECT DISTINCT type FROM bank_transactions ORDER BY type`);
+      return sendJson(res, 200, { ok: true, data: { transactions: rows, types: types.map(t => t.type) } });
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // GEMEINDEN-RANKING
+    // ══════════════════════════════════════════════════════════════
+    if (req.method === 'GET' && pathname === '/api/admin/ranking') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+      const sortBy = requestUrl.searchParams.get('sort') || 'population';
+      const validSorts = ['population', 'treasury', 'jobs', 'members'];
+      const col = validSorts.includes(sortBy) ? sortBy : 'population';
+      const orderCol = col === 'members' ? 'members_count' : `ms.${col}`;
+      const [rows] = await dbPool.query(`
+        SELECT m.id, m.name, m.slug, m.canton_code,
+               COALESCE(ms.population, 0) AS population,
+               COALESCE(ms.treasury, 0)   AS treasury,
+               COALESCE(ms.jobs, 0)       AS jobs,
+               COUNT(DISTINCT u.id)       AS members_count,
+               MAX(u.last_online_at)      AS last_active
+        FROM municipalities m
+        LEFT JOIN municipality_stats ms ON ms.municipality_id = m.id
+        LEFT JOIN users u ON u.municipality_id = m.id
+        GROUP BY m.id, m.name, m.slug, m.canton_code, ms.population, ms.treasury, ms.jobs
+        ORDER BY ${orderCol} DESC
+        LIMIT 50
+      `);
+      return sendJson(res, 200, { ok: true, data: { municipalities: rows } });
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // SERVER-AKTIONEN
+    // ══════════════════════════════════════════════════════════════
+    if (req.method === 'POST' && pathname === '/api/admin/actions/broadcast') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+      const body = await readJsonBody(req);
+      const { message, title, type = 'info' } = body;
+      if (!message) return sendJson(res, 422, { ok: false, error: 'message fehlt' });
+      const io = deps?.io;
+      if (io) {
+        io.emit('admin-broadcast', { title: title || 'Server-Nachricht', message, type, timestamp: Date.now() });
+      }
+      return sendJson(res, 200, { ok: true, data: { sent: true } });
+    }
+
+    if (req.method === 'POST' && pathname === '/api/admin/actions/clear-cache') {
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+      const { invalidateRoomItemsCache } = require('../../jobs/intervals');
+      const { roomRuntimeCache } = require('../../game/rooms');
+      let cleared = 0;
+      for (const [, entry] of roomRuntimeCache.entries()) {
+        if (entry.municipalityId && entry.roomCode) {
+          invalidateRoomItemsCache(entry.municipalityId, entry.roomCode);
+          cleared++;
+        }
+      }
+      return sendJson(res, 200, { ok: true, data: { cleared } });
+    }
+
+    if (req.method === 'POST' && pathname === '/api/admin/actions/kick-all') {
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+      const body = await readJsonBody(req);
+      const { reason = 'Server-Wartung' } = body;
+      const io = deps?.io;
+      let kicked = 0;
+      if (io) {
+        for (const [, sock] of io.sockets.sockets.entries()) {
+          sock.emit('force-disconnect', { reason });
+          sock.disconnect(true);
+          kicked++;
+        }
+      }
+      return sendJson(res, 200, { ok: true, data: { kicked } });
+    }
+
+    // ── Gemeinde-Rollen: Mitglieder einer Gemeinde abrufen ──────────────────
+    if (req.method === 'GET' && pathname === '/api/admin/municipality-members') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+      const muniId = Number(requestUrl.searchParams.get('municipality_id') || 0);
+      if (!muniId) return sendJson(res, 400, { ok: false, error: 'municipality_id fehlt' });
+      const [rows] = await dbPool.query(
+        `SELECT mm.user_id, mm.role, mm.joined_at, u.nickname
+         FROM municipality_memberships mm
+         JOIN users u ON u.id = mm.user_id
+         WHERE mm.municipality_id = ?
+         ORDER BY FIELD(mm.role,'owner','council','citizen','observer'), u.nickname`,
+        [muniId]
+      );
+      return sendJson(res, 200, { ok: true, data: { members: rows } });
+    }
+
+    // ── Gemeinde-Rolle setzen (add oder update) ─────────────────────────────
+    if (req.method === 'POST' && pathname === '/api/admin/municipality-role') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+      const body = await readJsonBody(req);
+      const { municipality_id, user_id, role } = body;
+      if (!municipality_id || !user_id || !role) return sendJson(res, 400, { ok: false, error: 'municipality_id, user_id und role erforderlich' });
+      const validRoles = ['owner', 'council', 'citizen', 'observer'];
+      if (!validRoles.includes(role)) return sendJson(res, 400, { ok: false, error: `Ungültige Rolle. Erlaubt: ${validRoles.join(', ')}` });
+      // Prüfe ob User existiert und zur Gemeinde gehört
+      const [[userRow]] = await dbPool.query(`SELECT id, nickname, municipality_id FROM users WHERE id = ?`, [user_id]);
+      if (!userRow) return sendJson(res, 404, { ok: false, error: 'User nicht gefunden' });
+      // Wenn User nicht Mitglied, erst zur Gemeinde hinzufügen
+      if (userRow.municipality_id !== municipality_id) {
+        await dbPool.query(`UPDATE users SET municipality_id = ? WHERE id = ?`, [municipality_id, user_id]);
+      }
+      // Upsert Mitgliedschaft mit neuer Rolle
+      await dbPool.query(
+        `INSERT INTO municipality_memberships (municipality_id, user_id, role, joined_at, created_at)
+         VALUES (?, ?, ?, NOW(), NOW())
+         ON DUPLICATE KEY UPDATE role = VALUES(role)`,
+        [municipality_id, user_id, role]
+      );
+      // Falls owner: alten owner auf council setzen
+      if (role === 'owner') {
+        await dbPool.query(
+          `UPDATE municipality_memberships SET role = 'council'
+           WHERE municipality_id = ? AND user_id != ? AND role = 'owner'`,
+          [municipality_id, user_id]
+        );
+      }
+      return sendJson(res, 200, { ok: true, data: { message: `${userRow.nickname} ist jetzt ${role} in der Gemeinde` } });
+    }
+
+    // ── Gemeinde-Mitglied entfernen ──────────────────────────────────────────
+    if (req.method === 'DELETE' && pathname === '/api/admin/municipality-role') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+      const body = await readJsonBody(req);
+      const { municipality_id, user_id } = body;
+      if (!municipality_id || !user_id) return sendJson(res, 400, { ok: false, error: 'municipality_id und user_id erforderlich' });
+      const [[mem]] = await dbPool.query(`SELECT role FROM municipality_memberships WHERE municipality_id = ? AND user_id = ?`, [municipality_id, user_id]);
+      if (!mem) return sendJson(res, 404, { ok: false, error: 'Mitgliedschaft nicht gefunden' });
+      if (mem.role === 'owner') return sendJson(res, 400, { ok: false, error: 'Präsident kann nicht einfach entfernt werden — erst Rolle ändern' });
+      await dbPool.query(`DELETE FROM municipality_memberships WHERE municipality_id = ? AND user_id = ?`, [municipality_id, user_id]);
+      await dbPool.query(`UPDATE users SET municipality_id = NULL WHERE id = ? AND municipality_id = ?`, [user_id, municipality_id]);
+      return sendJson(res, 200, { ok: true, data: { message: 'Mitglied entfernt' } });
+    }
+
+    if (req.method === 'GET' && pathname === '/api/admin/actions/server-info') {
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+      const { roomRuntimeCache } = require('../../game/rooms');
+      const mem = process.memoryUsage();
+      const { wsRoomPlayers: roomPlayers } = require('../../ws/socketio/index');
+      let activeSessions = 0;
+      for (const [, players] of roomPlayers.entries()) activeSessions += players.size;
+      return sendJson(res, 200, { ok: true, data: {
+        uptime: process.uptime(),
+        memHeapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+        memHeapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
+        memRssMB: Math.round(mem.rss / 1024 / 1024),
+        activeRooms: roomRuntimeCache.size,
+        activeSessions,
+        nodeVersion: process.version,
+        pid: process.pid,
+      }});
     }
 
   };

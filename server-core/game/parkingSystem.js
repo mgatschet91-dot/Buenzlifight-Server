@@ -137,6 +137,37 @@ async function handleVehicleLeft(municipalityId, tileX, tileY, slot) {
   }
 }
 
+// ── Ablauf-Tick: Abgelaufene Fahrzeuge rauswerfen (alle 60 s) ─────────────────
+async function runParkingExpiryTick(broadcastToRoom) {
+  ensureDbEnabled();
+  try {
+    // Alle Fahrzeuge die ihre leave_after_seconds überschritten haben
+    const [expired] = await dbPool.query(
+      `SELECT id, municipality_id, tile_x, tile_y, slot
+       FROM parked_vehicles
+       WHERE parked_at + INTERVAL leave_after_seconds SECOND < NOW()`
+    );
+    for (const v of expired) {
+      try {
+        await handleVehicleLeft(v.municipality_id, v.tile_x, v.tile_y, v.slot);
+        await dbPool.query(
+          `DELETE FROM parked_vehicles WHERE id = ?`,
+          [v.id]
+        );
+        if (broadcastToRoom) {
+          broadcastToRoom(v.municipality_id, 'vehicle-left-parking', {
+            tileX: v.tile_x, tileY: v.tile_y, slot: v.slot,
+          });
+        }
+      } catch (err) {
+        logError('PARKING', 'Ablauf-Tick Einzelfahrzeug Fehler', { error: err?.message, id: v.id });
+      }
+    }
+  } catch (err) {
+    logError('PARKING', 'runParkingExpiryTick Fehler', { error: err?.message });
+  }
+}
+
 // ── Kontrolleur-Tick: Schwarzparker büssen (alle 30 s) ────────────────────────
 async function runParkingControlTick(broadcastToRoom) {
   ensureDbEnabled();
@@ -163,30 +194,39 @@ async function runParkingControlTick(broadcastToRoom) {
         [municipality_id, maxPerTick]
       );
 
-      for (const v of violations) {
-        await dbPool.query(
-          `UPDATE parking_violations SET status = 'fined', security_company_id = ?, fined_at = NOW() WHERE id = ?`,
-          [company_id, v.id]
-        );
+      if (violations.length === 0) continue;
 
-        // 50 CHF → Gemeindekasse
-        await dbPool.query(
-          `UPDATE municipality_stats SET treasury = treasury + ? WHERE municipality_id = ?`,
-          [FINE_COMMUNE, municipality_id]
-        );
+      // Batch: alle Verstösse auf einmal als 'fined' markieren
+      const ids = violations.map(v => v.id);
+      const placeholders = ids.map(() => '?').join(',');
+      await dbPool.query(
+        `UPDATE parking_violations SET status = 'fined', security_company_id = ?, fined_at = NOW() WHERE id IN (${placeholders})`,
+        [company_id, ...ids]
+      );
+
+      // Batch: Gemeindekasse einmal erhöhen (FINE_COMMUNE × Anzahl)
+      const totalCommune = FINE_COMMUNE * violations.length;
+      await dbPool.query(
+        `UPDATE municipality_stats SET treasury = treasury + ? WHERE municipality_id = ?`,
+        [totalCommune, municipality_id]
+      );
+
+      // Batch: Security-Firma einmal erhöhen
+      const totalCompany = FINE_COMPANY * violations.length;
+      await dbPool.query(`UPDATE companies SET balance = balance + ? WHERE id = ?`, [totalCompany, company_id]);
+
+      // Batch: company_finances-Einträge per Bulk-Insert
+      const financeValues = violations.map(() => `(?, ?, (SELECT balance FROM companies WHERE id = ?), 'parking_fine_provision')`).join(',');
+      const financeParams = violations.flatMap(() => [company_id, FINE_COMPANY, company_id]);
+      await dbPool.query(`INSERT INTO company_finances (company_id, amount, balance_after, reason) VALUES ${financeValues}`, financeParams);
+
+      // Ledger-Einträge (1 pro Verstoss für Nachvollziehbarkeit)
+      for (const v of violations) {
         await _ledger(municipality_id, 'parking_fine', FINE_COMMUNE, {
           violationId: v.id, tileX: v.tile_x, tileY: v.tile_y, slot: v.slot,
           companyId: company_id, companyName: company_name,
           totalFine: v.fine_amount, companyShare: FINE_COMPANY,
         });
-
-        // 20 CHF → Security-Firma
-        await dbPool.query(`UPDATE companies SET balance = balance + ? WHERE id = ?`, [FINE_COMPANY, company_id]);
-        await dbPool.query(
-          `INSERT INTO company_finances (company_id, amount, balance_after, reason)
-           VALUES (?, ?, (SELECT balance FROM companies WHERE id = ?), 'parking_fine_provision')`,
-          [company_id, FINE_COMPANY, company_id]
-        );
 
         if (broadcastToRoom) {
           broadcastToRoom(municipality_id, 'parking-fine-issued', {
@@ -240,6 +280,7 @@ async function getParkingViolations(municipalityId) {
 module.exports = {
   handleVehicleParked,
   handleVehicleLeft,
+  runParkingExpiryTick,
   runParkingControlTick,
   setParkingConfig,
   getParkingConfigs,
