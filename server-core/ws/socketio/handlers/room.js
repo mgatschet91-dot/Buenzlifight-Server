@@ -178,6 +178,10 @@ module.exports = function registerRoomHandlers(socket, io, context) {
               : 'observer';
             state.socketMunicipalityRole = municipalityRole;
             state.socketMunicipalityId = municipality ? Number(municipality.id) : null;
+            // Aktivitäts-Timestamp aktualisieren (zählt als Gemeinde-Aktivität)
+            if (municipality && authUser) {
+              municipalityMod.touchMunicipalityActivity(Number(municipality.id), Number(authUser.id)).catch(() => {});
+            }
             // Load bauzone mode for this municipality
             if (municipality) {
               try {

@@ -10,7 +10,14 @@ const { randomUUID } = require('crypto');
 const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, FRONTEND_URL } = require('../../config/constants');
 
 // PKCE-losen State als einfacher CSRF-Schutz
-const pendingStates = new Set();
+// Map: state -> { redirectTo }
+const pendingStates = new Map();
+
+const ALLOWED_REDIRECTS = [
+  'https://buenzlifight.ch',
+  'http://127.0.0.1:3001',
+  'http://localhost:3001',
+];
 
 function httpsGet(url) {
   return new Promise((resolve, reject) => {
@@ -47,8 +54,12 @@ module.exports = function registerGoogleAuthRoutes(deps) {
     if (req.method === 'GET' && pathname === '/api/auth/google') {
       if (!GOOGLE_CLIENT_ID) return sendJson(res, 503, { ok: false, error: 'Google OAuth nicht konfiguriert' });
 
+      const requestUrl2 = new URL(`https://dummy${req.url}`);
+      const redirectToParam = requestUrl2.searchParams.get('redirect_to') || '';
+      const safeRedirect = ALLOWED_REDIRECTS.find(r => redirectToParam.startsWith(r)) ? redirectToParam : null;
+
       const state = randomUUID().replace(/-/g, '');
-      pendingStates.add(state);
+      pendingStates.set(state, { redirectTo: safeRedirect });
       setTimeout(() => pendingStates.delete(state), 10 * 60 * 1000); // 10 Min Ablauf
 
       const params = new URLSearchParams({
@@ -72,18 +83,20 @@ module.exports = function registerGoogleAuthRoutes(deps) {
       const code = requestUrl.searchParams.get('code');
       const state = requestUrl.searchParams.get('state');
       const error = requestUrl.searchParams.get('error');
-      const frontendUrl = FRONTEND_URL || 'https://buenzlifight.ch';
+      const defaultFrontendUrl = FRONTEND_URL || 'https://buenzlifight.ch';
 
       if (error || !code) {
-        res.writeHead(302, { Location: `${frontendUrl}?auth_error=abgebrochen` });
+        res.writeHead(302, { Location: `${defaultFrontendUrl}?auth_error=abgebrochen` });
         return res.end();
       }
 
       if (!pendingStates.has(state)) {
-        res.writeHead(302, { Location: `${frontendUrl}?auth_error=ungueltig` });
+        res.writeHead(302, { Location: `${defaultFrontendUrl}?auth_error=ungueltig` });
         return res.end();
       }
+      const stateData = pendingStates.get(state);
       pendingStates.delete(state);
+      const frontendUrl = stateData?.redirectTo || FRONTEND_URL || 'https://buenzlifight.ch';
 
       try {
         // 1. Code gegen Token tauschen

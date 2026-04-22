@@ -217,6 +217,7 @@ function registerIntervals(deps) {
             const hasActiveCrime = crimeResult && (crimeResult.criminals?.length > 0 || crimeResult.crimeEvents?.length > 0);
             const homelessCount = crimeResult?.homeless || 0;
             if (hasActiveCrime || homelessCount > 0) {
+              const now = Date.now();
               const crimePayload = {
                 criminals: crimeResult?.criminals || [],
                 crimeEvents: crimeResult?.crimeEvents || [],
@@ -224,10 +225,12 @@ function registerIntervals(deps) {
                 gridSize: crimeResult?.gridSize || 0,
                 homeless: homelessCount,
                 isNight: crimeResult?.isNight || false,
-                serverTimestamp: Date.now(),
+                serverTimestamp: now,
               };
-              // Crime-Grid nur senden wenn sich was geaendert hat
-              if (crimeResult.crimeGrid && crimeResult.gridSize > 0) {
+              // Crime-Grid nur senden wenn sich was geaendert hat UND max alle 15s (grosse Payloads)
+              const crimeGridThrottle = 15000;
+              const canSendCrimeGrid = !entry._lastCrimeGridBroadcast || (now - entry._lastCrimeGridBroadcast) >= crimeGridThrottle;
+              if (canSendCrimeGrid && crimeResult.crimeGrid && crimeResult.gridSize > 0) {
                 const flatCrime = new Array(crimeResult.gridSize * crimeResult.gridSize);
                 for (let gy = 0; gy < crimeResult.gridSize; gy++) {
                   const row = crimeResult.crimeGrid[gy];
@@ -236,6 +239,7 @@ function registerIntervals(deps) {
                   }
                 }
                 crimePayload.crimeGrid = flatCrime;
+                entry._lastCrimeGridBroadcast = now;
               }
               io.to(roomKey).emit('criminals-authoritative', crimePayload);
             }
@@ -266,27 +270,33 @@ function registerIntervals(deps) {
               });
             }
 
-            // LandValue-Grid broadcasten (nur bei Änderung)
+            // LandValue-Grid broadcasten (nur bei Änderung, max alle 15s fuer grosse Gemeinden)
             const lvGrid = rawStats?._landValueGrid;
             if (lvGrid && Array.isArray(lvGrid) && lvGrid.length > 0) {
-              const gridSize = lvGrid.length;
-              const flatValues = new Array(gridSize * gridSize);
-              let checksum = 0;
-              for (let gy = 0; gy < gridSize; gy++) {
-                const row = lvGrid[gy];
-                for (let gx = 0; gx < gridSize; gx++) {
-                  const v = Math.round(row[gx] || 0);
-                  flatValues[gy * gridSize + gx] = v;
-                  checksum = (checksum + v * (gy * gridSize + gx + 1)) | 0;
+              const lvNow = Date.now();
+              const lvThrottle = 15000;
+              const canSendLvGrid = !entry._lastLvGridBroadcast || (lvNow - entry._lastLvGridBroadcast) >= lvThrottle;
+              if (canSendLvGrid) {
+                const gridSize = lvGrid.length;
+                const flatValues = new Array(gridSize * gridSize);
+                let checksum = 0;
+                for (let gy = 0; gy < gridSize; gy++) {
+                  const row = lvGrid[gy];
+                  for (let gx = 0; gx < gridSize; gx++) {
+                    const v = Math.round(row[gx] || 0);
+                    flatValues[gy * gridSize + gx] = v;
+                    checksum = (checksum + v * (gy * gridSize + gx + 1)) | 0;
+                  }
                 }
-              }
-              if (checksum !== (entry._lvChecksum || 0)) {
-                entry._lvChecksum = checksum;
-                io.to(roomKey).emit('landvalue-authoritative', {
-                  gridSize,
-                  values: flatValues,
-                  serverTimestamp: Date.now(),
-                });
+                if (checksum !== (entry._lvChecksum || 0)) {
+                  entry._lvChecksum = checksum;
+                  entry._lastLvGridBroadcast = lvNow;
+                  io.to(roomKey).emit('landvalue-authoritative', {
+                    gridSize,
+                    values: flatValues,
+                    serverTimestamp: lvNow,
+                  });
+                }
               }
             }
           }
@@ -664,6 +674,28 @@ function registerIntervals(deps) {
       logError('INTERVAL', 'Parkraum-Kontrolleur-Tick Fehler', { error: err?.message });
     }
   }, 30000)); // alle 30 Sekunden
+
+  const getMunicipality = () => require('../game/municipality');
+
+  // 17) Election-Phase-Check + No-Confidence-Ablauf (every 60s)
+  intervals.push(setInterval(async () => {
+    try {
+      const m = getMunicipality();
+      await m.resolveElectionPhases();
+      await m.resolveExpiredNoConfidenceVotes();
+    } catch (err) {
+      logError('INTERVAL', 'Election phase check error', { error: err?.message });
+    }
+  }, 60000));
+
+  // 18) Bürgermeister-Nachfolge bei Inaktivität (alle 6h)
+  intervals.push(setInterval(async () => {
+    try {
+      await getMunicipality().checkAndSucceedInactiveMunicipalityOwners();
+    } catch (err) {
+      logError('INTERVAL', 'Mayor succession tick error', { error: err?.message });
+    }
+  }, 6 * 60 * 60 * 1000));
 
   logInfo('JOBS', `${intervals.length} Intervalle registriert`);
   return intervals;

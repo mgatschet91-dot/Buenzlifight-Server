@@ -61,7 +61,11 @@ async function searchMunicipalitiesForPartnerships(query = '', limit = 500) {
   ensureDbEnabled();
   const q = String(query || '').trim().toLowerCase();
   const safeLimit = Math.max(1, Math.min(2000, Math.round(Number(limit || 500))));
-  const where = ['m.is_active = 1'];
+  const where = [
+    'm.is_active = 1',
+    'ms.population >= 100',
+    'ms.jobs > 0',
+  ];
   const args = [];
   if (q) {
     where.push('(LOWER(m.name) LIKE ? OR LOWER(m.slug) LIKE ?)');
@@ -76,14 +80,12 @@ async function searchMunicipalitiesForPartnerships(query = '', limit = 500) {
       m.slug,
       m.canton_code,
       m.canton_name,
-      (
-        SELECT COUNT(*)
-        FROM users u_count
-        WHERE u_count.municipality_id = m.id AND u_count.is_active = 1
-      ) AS member_count,
+      ms.population AS member_count,
+      ms.jobs,
       owner.id AS owner_id,
       owner.nickname AS owner_nickname
      FROM municipalities m
+     INNER JOIN municipality_stats ms ON ms.municipality_id = m.id
      LEFT JOIN users owner ON owner.id = (
        SELECT MIN(u2.id)
        FROM users u2
@@ -236,15 +238,23 @@ async function syncMunicipalityMemberships(municipalityId) {
   );
   const activeRows = Array.isArray(activeUsers) ? activeUsers : [];
   if (activeRows.length <= 0) {
-    await dbPool.query(
-      `DELETE FROM municipality_memberships
-       WHERE municipality_id = ?`,
-      [municipalityId]
-    );
+    await dbPool.query(`DELETE FROM municipality_memberships WHERE municipality_id = ?`, [municipalityId]);
     return;
   }
 
-  const ownerUserId = Number(activeRows[0].id);
+  // Respect existing owner — only fall back to lowest-id if no owner row exists
+  const [existingOwnerRows] = await dbPool.query(
+    `SELECT mm.user_id FROM municipality_memberships mm
+     INNER JOIN users u ON u.id = mm.user_id
+     WHERE mm.municipality_id = ? AND mm.role = 'owner'
+       AND u.is_active = 1 AND u.municipality_id = ?
+     LIMIT 1`,
+    [municipalityId, municipalityId]
+  );
+  const ownerUserId = existingOwnerRows.length > 0
+    ? Number(existingOwnerRows[0].user_id)
+    : Number(activeRows[0].id);
+
   const values = [];
   const params = [];
   for (const row of activeRows) {
@@ -258,35 +268,421 @@ async function syncMunicipalityMemberships(municipalityId) {
     );
   }
   if (values.length > 0) {
+    // ON DUPLICATE KEY: nur updated_at → bestehende Rollen (council etc.) bleiben erhalten
     await dbPool.query(
       `INSERT INTO municipality_memberships (municipality_id, user_id, role)
        VALUES ${values.join(', ')}
-       ON DUPLICATE KEY UPDATE
-         updated_at = CURRENT_TIMESTAMP`,
+       ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP`,
       params
     );
   }
 
+  // Genau einen Owner sicherstellen
   await dbPool.query(
-    `UPDATE municipality_memberships
-     SET role = ?, updated_at = CURRENT_TIMESTAMP
+    `UPDATE municipality_memberships SET role = ?, updated_at = CURRENT_TIMESTAMP
      WHERE municipality_id = ? AND user_id = ?`,
     [MUNICIPALITY_ROLE_OWNER, municipalityId, ownerUserId]
   );
+  // Weitere Owner-Einträge (sollte nicht passieren) auf citizen zurücksetzen
   await dbPool.query(
-    `UPDATE municipality_memberships
-     SET role = ?, updated_at = CURRENT_TIMESTAMP
+    `UPDATE municipality_memberships SET role = ?, updated_at = CURRENT_TIMESTAMP
      WHERE municipality_id = ? AND user_id <> ? AND role = ?`,
     [MUNICIPALITY_ROLE_CITIZEN, municipalityId, ownerUserId, MUNICIPALITY_ROLE_OWNER]
   );
 
+  // Veraltete Memberships entfernen (User hat Gemeinde gewechselt oder ist deaktiviert)
   await dbPool.query(
-    `DELETE mm
-     FROM municipality_memberships mm
+    `DELETE mm FROM municipality_memberships mm
      LEFT JOIN users u ON u.id = mm.user_id
      WHERE mm.municipality_id = ?
        AND (u.id IS NULL OR u.is_active <> 1 OR u.municipality_id <> ?)`,
     [municipalityId, municipalityId]
+  );
+}
+
+// Setzt einen User als neuen Bürgermeister (alten Owner → citizen)
+async function promoteToOwner(municipalityId, userId) {
+  ensureDbEnabled();
+  await dbPool.query(
+    `UPDATE municipality_memberships SET role = 'citizen', updated_at = CURRENT_TIMESTAMP
+     WHERE municipality_id = ? AND role = 'owner'`,
+    [municipalityId]
+  );
+  await dbPool.query(
+    `UPDATE municipality_memberships SET role = 'owner', updated_at = CURRENT_TIMESTAMP
+     WHERE municipality_id = ? AND user_id = ?`,
+    [municipalityId, userId]
+  );
+}
+
+// Aktualisiert den Aktivitäts-Timestamp eines Members (beim Room-Betreten, Bauen, Chatten)
+async function touchMunicipalityActivity(municipalityId, userId) {
+  if (!municipalityId || !userId) return;
+  try {
+    await dbPool.query(
+      `UPDATE municipality_memberships
+       SET last_municipality_activity_at = NOW()
+       WHERE municipality_id = ? AND user_id = ?`,
+      [municipalityId, userId]
+    );
+  } catch (_) {}
+}
+
+const OWNER_INACTIVITY_DAYS = 14;
+
+// Wird vom 6h-Job aufgerufen: prüft alle Gemeinden auf inaktive Bürgermeister
+async function checkAndSucceedInactiveMunicipalityOwners() {
+  ensureDbEnabled();
+  const [inactiveMunis] = await dbPool.query(
+    `SELECT mm.municipality_id, mm.user_id AS owner_id
+     FROM municipality_memberships mm
+     WHERE mm.role = 'owner'
+       AND (
+         mm.last_municipality_activity_at IS NULL
+         OR mm.last_municipality_activity_at < DATE_SUB(NOW(), INTERVAL ? DAY)
+       )`,
+    [OWNER_INACTIVITY_DAYS]
+  );
+
+  for (const { municipality_id, owner_id } of inactiveMunis) {
+    // Gibt es eine laufende Wahl? → nicht nochmal Nachfolge auslösen
+    const [activeElections] = await dbPool.query(
+      `SELECT id FROM municipality_elections
+       WHERE municipality_id = ? AND status IN ('candidates','voting')
+       LIMIT 1`,
+      [municipality_id]
+    );
+    if (activeElections.length > 0) continue;
+
+    // Nächsten aktiven Member suchen: Rat zuerst, dann Bürger, älteste Mitgliedschaft zuerst
+    const [candidates] = await dbPool.query(
+      `SELECT mm.user_id, mm.role
+       FROM municipality_memberships mm
+       WHERE mm.municipality_id = ?
+         AND mm.user_id <> ?
+         AND mm.role IN ('council','citizen')
+         AND mm.last_municipality_activity_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+       ORDER BY
+         CASE mm.role WHEN 'council' THEN 0 ELSE 1 END ASC,
+         mm.created_at ASC
+       LIMIT 1`,
+      [municipality_id, owner_id, OWNER_INACTIVITY_DAYS]
+    );
+
+    if (candidates.length > 0) {
+      await promoteToOwner(municipality_id, candidates[0].user_id);
+    }
+    // Keine aktiven Members → nichts tun; nächster Beitretende wird Owner via Invite-Route
+  }
+}
+
+// ─── Election System ──────────────────────────────────────────────────────────
+
+async function getActiveElection(municipalityId) {
+  ensureDbEnabled();
+  const [rows] = await dbPool.query(
+    `SELECT e.*,
+       (SELECT COUNT(*) FROM election_candidates c WHERE c.election_id = e.id AND c.withdrawn_at IS NULL) AS candidate_count,
+       (SELECT COUNT(*) FROM election_votes v WHERE v.election_id = e.id) AS vote_count
+     FROM municipality_elections e
+     WHERE e.municipality_id = ? AND e.status IN ('candidates','voting')
+     ORDER BY e.started_at DESC
+     LIMIT 1`,
+    [municipalityId]
+  );
+  return rows[0] || null;
+}
+
+async function getElectionDetails(electionId, municipalityId) {
+  ensureDbEnabled();
+  const [elRows] = await dbPool.query(
+    `SELECT * FROM municipality_elections WHERE id = ? AND municipality_id = ? LIMIT 1`,
+    [electionId, municipalityId]
+  );
+  if (!elRows[0]) return null;
+  const election = elRows[0];
+
+  const [candidates] = await dbPool.query(
+    `SELECT ec.user_id, ec.registered_at, ec.withdrawn_at, u.nickname,
+       (SELECT COUNT(*) FROM election_votes ev WHERE ev.election_id = ? AND ev.candidate_id = ec.user_id) AS votes
+     FROM election_candidates ec
+     JOIN users u ON u.id = ec.user_id
+     WHERE ec.election_id = ?
+     ORDER BY ec.registered_at ASC`,
+    [electionId, electionId]
+  );
+
+  return { election, candidates: Array.isArray(candidates) ? candidates : [] };
+}
+
+// Öffnet eine neue Wahl für eine Gemeinde
+async function openElection(municipalityId, triggeredBy = 'inactivity') {
+  ensureDbEnabled();
+
+  // Cooldown: 14 Tage nach letzter Wahl
+  const [muni] = await dbPool.query(
+    `SELECT last_election_ended_at FROM municipalities WHERE id = ? LIMIT 1`,
+    [municipalityId]
+  );
+  if (muni[0]?.last_election_ended_at) {
+    const daysSince = (Date.now() - new Date(muni[0].last_election_ended_at).getTime()) / 86400000;
+    if (daysSince < 14 && triggeredBy !== 'admin') {
+      throw new Error('ELECTION_COOLDOWN');
+    }
+  }
+
+  // Bereits laufende Wahl?
+  const existing = await getActiveElection(municipalityId);
+  if (existing) throw new Error('ELECTION_ALREADY_ACTIVE');
+
+  const candidatesUntil = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000); // +3 Tage
+  const votingUntil    = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // +7 Tage
+
+  const [result] = await dbPool.query(
+    `INSERT INTO municipality_elections
+       (municipality_id, status, triggered_by, candidates_until, voting_until)
+     VALUES (?, 'candidates', ?, ?, ?)`,
+    [municipalityId, triggeredBy, candidatesUntil, votingUntil]
+  );
+  return result.insertId;
+}
+
+// User kandidiert für die laufende Wahl
+async function registerCandidate(electionId, userId, municipalityId) {
+  ensureDbEnabled();
+
+  // Mindest-Mitgliedschaft: 7 Tage
+  const [memRows] = await dbPool.query(
+    `SELECT created_at, candidate_withdrawn FROM municipality_memberships
+     WHERE municipality_id = ? AND user_id = ? LIMIT 1`,
+    [municipalityId, userId]
+  );
+  if (!memRows[0]) throw new Error('NOT_A_MEMBER');
+  const joinedDaysAgo = (Date.now() - new Date(memRows[0].created_at).getTime()) / 86400000;
+  if (joinedDaysAgo < 7) throw new Error('TOO_NEW'); // mind. 7 Tage Mitglied
+
+  // Bereits zurückgezogen in dieser Wahl?
+  const [existing] = await dbPool.query(
+    `SELECT id, withdrawn_at FROM election_candidates WHERE election_id = ? AND user_id = ? LIMIT 1`,
+    [electionId, userId]
+  );
+  if (existing[0]) {
+    if (existing[0].withdrawn_at) throw new Error('ALREADY_WITHDRAWN');
+    throw new Error('ALREADY_CANDIDATE');
+  }
+
+  // Max 10 Kandidaten
+  const [countRows] = await dbPool.query(
+    `SELECT COUNT(*) AS cnt FROM election_candidates WHERE election_id = ? AND withdrawn_at IS NULL`,
+    [electionId]
+  );
+  if (Number(countRows[0].cnt) >= 10) throw new Error('MAX_CANDIDATES');
+
+  await dbPool.query(
+    `INSERT INTO election_candidates (election_id, user_id) VALUES (?, ?)`,
+    [electionId, userId]
+  );
+}
+
+// Kandidatur zurückziehen (nur 1x möglich)
+async function withdrawCandidacy(electionId, userId) {
+  ensureDbEnabled();
+  const [rows] = await dbPool.query(
+    `SELECT id, withdrawn_at FROM election_candidates WHERE election_id = ? AND user_id = ? LIMIT 1`,
+    [electionId, userId]
+  );
+  if (!rows[0]) throw new Error('NOT_A_CANDIDATE');
+  if (rows[0].withdrawn_at) throw new Error('ALREADY_WITHDRAWN');
+
+  await dbPool.query(
+    `UPDATE election_candidates SET withdrawn_at = NOW() WHERE id = ?`,
+    [rows[0].id]
+  );
+}
+
+// Stimme abgeben
+async function castVote(electionId, voterId, candidateUserId, municipalityId) {
+  ensureDbEnabled();
+
+  // Mindest-Mitgliedschaft zum Wählen: 3 Tage
+  const [memRows] = await dbPool.query(
+    `SELECT created_at FROM municipality_memberships
+     WHERE municipality_id = ? AND user_id = ? LIMIT 1`,
+    [municipalityId, voterId]
+  );
+  if (!memRows[0]) throw new Error('NOT_A_MEMBER');
+  const joinedDaysAgo = (Date.now() - new Date(memRows[0].created_at).getTime()) / 86400000;
+  if (joinedDaysAgo < 3) throw new Error('TOO_NEW');
+
+  // Kandidat muss aktiv und nicht zurückgezogen sein
+  const [candRows] = await dbPool.query(
+    `SELECT id FROM election_candidates
+     WHERE election_id = ? AND user_id = ? AND withdrawn_at IS NULL LIMIT 1`,
+    [electionId, candidateUserId]
+  );
+  if (!candRows[0]) throw new Error('INVALID_CANDIDATE');
+
+  // 1 Stimme pro User (UNIQUE constraint wirft Fehler bei Duplikat)
+  try {
+    await dbPool.query(
+      `INSERT INTO election_votes (election_id, voter_id, candidate_id) VALUES (?, ?, ?)`,
+      [electionId, voterId, candidateUserId]
+    );
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') throw new Error('ALREADY_VOTED');
+    throw err;
+  }
+}
+
+// Prüft Phasen aller laufenden Wahlen und wertet aus (vom 60s-Job aufgerufen)
+async function resolveElectionPhases() {
+  ensureDbEnabled();
+
+  // candidates → voting (Kandidaturphase abgelaufen)
+  await dbPool.query(
+    `UPDATE municipality_elections
+     SET status = 'voting'
+     WHERE status = 'candidates' AND candidates_until <= NOW()`
+  );
+
+  // voting → auswerten (Abstimmungsphase abgelaufen)
+  const [toClose] = await dbPool.query(
+    `SELECT * FROM municipality_elections WHERE status = 'voting' AND voting_until <= NOW()`
+  );
+
+  for (const election of toClose) {
+    // Kandidat mit den meisten Stimmen; Gleichstand → ältestes Mitglied
+    const [winners] = await dbPool.query(
+      `SELECT ec.user_id, COUNT(ev.id) AS votes, mm.created_at AS joined_at
+       FROM election_candidates ec
+       LEFT JOIN election_votes ev ON ev.election_id = ec.election_id AND ev.candidate_id = ec.user_id
+       LEFT JOIN municipality_memberships mm ON mm.municipality_id = ? AND mm.user_id = ec.user_id
+       WHERE ec.election_id = ? AND ec.withdrawn_at IS NULL
+       GROUP BY ec.user_id
+       ORDER BY votes DESC, joined_at ASC
+       LIMIT 1`,
+      [election.municipality_id, election.id]
+    );
+
+    if (winners.length > 0) {
+      const winner = winners[0];
+      await promoteToOwner(election.municipality_id, winner.user_id);
+      await dbPool.query(
+        `UPDATE municipality_elections
+         SET status = 'closed', winner_user_id = ?, closed_at = NOW()
+         WHERE id = ?`,
+        [winner.user_id, election.id]
+      );
+    } else {
+      // Keine Kandidaten → Wahl abbrechen
+      await dbPool.query(
+        `UPDATE municipality_elections SET status = 'cancelled', closed_at = NOW() WHERE id = ?`,
+        [election.id]
+      );
+    }
+
+    // Cooldown-Timestamp in der Gemeinde setzen
+    await dbPool.query(
+      `UPDATE municipalities SET last_election_ended_at = NOW() WHERE id = ?`,
+      [election.municipality_id]
+    );
+  }
+}
+
+// Misstrauensvotum: Rat ruft Abstimmung gegen BM aus
+async function openNoConfidenceVote(municipalityId, requestedByUserId) {
+  ensureDbEnabled();
+
+  // Anti-Spam: derselbe Rat max 1x pro 30 Tage
+  const [memRows] = await dbPool.query(
+    `SELECT council_election_requested_at FROM municipality_memberships
+     WHERE municipality_id = ? AND user_id = ? LIMIT 1`,
+    [municipalityId, requestedByUserId]
+  );
+  if (memRows[0]?.council_election_requested_at) {
+    const daysSince = (Date.now() - new Date(memRows[0].council_election_requested_at).getTime()) / 86400000;
+    if (daysSince < 30) throw new Error('REQUEST_COOLDOWN');
+  }
+
+  // Bereits offenes Misstrauensvotum?
+  const [existing] = await dbPool.query(
+    `SELECT id FROM municipality_no_confidence WHERE municipality_id = ? AND status = 'open' LIMIT 1`,
+    [municipalityId]
+  );
+  if (existing.length > 0) throw new Error('ALREADY_OPEN');
+
+  const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000); // 48h
+  const [result] = await dbPool.query(
+    `INSERT INTO municipality_no_confidence (municipality_id, requested_by, expires_at)
+     VALUES (?, ?, ?)`,
+    [municipalityId, requestedByUserId, expiresAt]
+  );
+
+  await dbPool.query(
+    `UPDATE municipality_memberships SET council_election_requested_at = NOW()
+     WHERE municipality_id = ? AND user_id = ?`,
+    [municipalityId, requestedByUserId]
+  );
+
+  return result.insertId;
+}
+
+// Rat stimmt beim Misstrauensvotum zu
+async function voteNoConfidence(noConfidenceId, voterUserId, municipalityId) {
+  ensureDbEnabled();
+  try {
+    await dbPool.query(
+      `INSERT INTO municipality_no_confidence_votes (no_confidence_id, voter_id) VALUES (?, ?)`,
+      [noConfidenceId, voterUserId]
+    );
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') throw new Error('ALREADY_VOTED');
+    throw err;
+  }
+
+  // Prüfen ob 2/3 Mehrheit der aktiven Räte erreicht
+  const [councilRows] = await dbPool.query(
+    `SELECT COUNT(*) AS cnt FROM municipality_memberships
+     WHERE municipality_id = ? AND role = 'council'
+       AND last_municipality_activity_at >= DATE_SUB(NOW(), INTERVAL 14 DAY)`,
+    [municipalityId]
+  );
+  const totalCouncil = Number(councilRows[0].cnt);
+  const [voteRows] = await dbPool.query(
+    `SELECT COUNT(*) AS cnt FROM municipality_no_confidence_votes WHERE no_confidence_id = ?`,
+    [noConfidenceId]
+  );
+  const totalVotes = Number(voteRows[0].cnt);
+
+  if (totalCouncil >= 2 && totalVotes >= Math.ceil((totalCouncil * 2) / 3)) {
+    // Misstrauensvotum bestanden → BM absetzen, ältesten aktiven Rat befördern oder Wahl starten
+    await dbPool.query(
+      `UPDATE municipality_no_confidence SET status = 'passed' WHERE id = ?`,
+      [noConfidenceId]
+    );
+    const [nextOwner] = await dbPool.query(
+      `SELECT user_id FROM municipality_memberships
+       WHERE municipality_id = ? AND role = 'council'
+         AND last_municipality_activity_at >= DATE_SUB(NOW(), INTERVAL 14 DAY)
+       ORDER BY created_at ASC LIMIT 1`,
+      [municipalityId]
+    );
+    if (nextOwner.length > 0) {
+      await promoteToOwner(municipalityId, nextOwner[0].user_id);
+    } else {
+      await openElection(municipalityId, 'council_vote').catch(() => {});
+    }
+    return 'passed';
+  }
+  return 'pending';
+}
+
+// Ablauf prüfen für Misstrauensvoten (vom 60s-Job)
+async function resolveExpiredNoConfidenceVotes() {
+  ensureDbEnabled();
+  await dbPool.query(
+    `UPDATE municipality_no_confidence SET status = 'expired'
+     WHERE status = 'open' AND expires_at <= NOW()`
   );
 }
 
@@ -818,6 +1214,19 @@ module.exports = {
   ensureMunicipalityIsUserCreatedColumn,
   ensureMunicipalityRoleTables,
   syncMunicipalityMemberships,
+  promoteToOwner,
+  touchMunicipalityActivity,
+  checkAndSucceedInactiveMunicipalityOwners,
+  getActiveElection,
+  getElectionDetails,
+  openElection,
+  registerCandidate,
+  withdrawCandidacy,
+  castVote,
+  resolveElectionPhases,
+  openNoConfidenceVote,
+  voteNoConfidence,
+  resolveExpiredNoConfidenceVotes,
   getMunicipalityAdministration,
   getUserMunicipalityRole,
   getMunicipalityRoleMap,

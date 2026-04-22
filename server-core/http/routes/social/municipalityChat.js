@@ -27,9 +27,8 @@ function isGlobalAdmin(authUser) {
 }
 
 module.exports = function registerMunicipalityChatRoutes(deps) {
-  const { io } = deps;
-
   return async function handleMunicipalityChat(req, res, pathname, requestUrl) {
+    const io = deps?.io;
 
     // ================================================================
     // MUNICIPALITY CHAT

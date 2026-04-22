@@ -100,7 +100,7 @@ async function processTransportRevenue() {
 
       // Gemeinde-Daten: Population, Beschäftigung, Zufriedenheit, Steuersatz
       const [muniStats] = await dbPool.query(
-        `SELECT ms.population, ms.satisfaction, ms.tax_rate, ms.employed
+        `SELECT ms.population, ms.citizen_satisfaction AS satisfaction, ms.tax_rate
          FROM municipality_stats ms
          WHERE ms.municipality_id = ?
          LIMIT 1`,
@@ -108,7 +108,7 @@ async function processTransportRevenue() {
       );
 
       const population = muniStats[0]?.population || 0;
-      const employed = muniStats[0]?.employed || 0;
+      const employed = Math.floor(population * 0.6);
       const satisfaction = muniStats[0]?.satisfaction || 50;
       const taxRate = Number(muniStats[0]?.tax_rate || 10);
       const businessTaxRate = Math.max(0, Number((taxRate * 0.32).toFixed(2)));

@@ -40,11 +40,34 @@ const {
   saveMunicipalityCoatOfArmsPng,
   resolveMunicipalityCoatOfArmsDto,
   syncMunicipalityMemberships,
+  promoteToOwner,
+  touchMunicipalityActivity,
+  getActiveElection,
+  getElectionDetails,
+  openElection,
+  registerCandidate,
+  withdrawCandidacy,
+  castVote,
+  openNoConfidenceVote,
+  voteNoConfidence,
 } = require('../../game/municipality');
 const { createOrGetRoom, updateRoomState } = require('../../game/rooms');
 
 module.exports = function registerMunicipalityRoutes(deps) {
   return async function handleMunicipalities(req, res, pathname, requestUrl) {
+
+    // GET /api/municipalities/public — kein Auth erforderlich, für Steam-Onboarding
+    if (req.method === 'GET' && pathname === '/api/municipalities/public') {
+      ensureDbEnabled();
+      const [rows] = await dbPool.query(
+        `SELECT m.id, m.name, m.slug,
+                (SELECT COUNT(*) FROM municipality_memberships mm WHERE mm.municipality_id = m.id) AS member_count
+         FROM municipalities m
+         ORDER BY member_count DESC, m.name ASC
+         LIMIT 50`
+      );
+      return sendJson(res, 200, { ok: true, municipalities: rows, member_limit: MUNICIPALITY_MEMBER_LIMIT });
+    }
 
     // GET /api/municipalities
     if (req.method === 'GET' && pathname === '/api/municipalities') {
@@ -504,6 +527,19 @@ module.exports = function registerMunicipalityRoutes(deps) {
       await dbPool.query(`UPDATE users SET municipality_id = ? WHERE id = ?`, [municipality.id, targetUserId]);
       await syncMunicipalityMemberships(municipality.id);
 
+      // Kein aktiver Bürgermeister (14 Tage inaktiv oder leer)? → neuer User wird BM
+      const [activeOwnerRows] = await dbPool.query(
+        `SELECT mm.user_id FROM municipality_memberships mm
+         WHERE mm.municipality_id = ? AND mm.role = 'owner'
+           AND (mm.last_municipality_activity_at IS NULL
+                OR mm.last_municipality_activity_at >= DATE_SUB(NOW(), INTERVAL 14 DAY))
+         LIMIT 1`,
+        [municipality.id]
+      );
+      if (activeOwnerRows.length === 0) {
+        await promoteToOwner(municipality.id, targetUserId);
+      }
+
       return sendJson(res, 200, { ok: true, data: { invited: true, user_id: targetUserId, nickname: targetUser[0].nickname } });
     }
 
@@ -522,6 +558,220 @@ module.exports = function registerMunicipalityRoutes(deps) {
       );
       const mode = (Array.isArray(rows) && rows.length > 0) ? rows[0].bauzone_mode : 'disabled';
       return sendJson(res, 200, { ok: true, data: { bauzone_mode: mode } });
+    }
+
+    // ── Election Routes ───────────────────────────────────────────────────────
+
+    // GET /api/game/municipality/:slug/election — aktuelle Wahl + Details
+    const electionGetMatch = pathname.match(/^\/api\/game\/municipality\/([a-z0-9-]+)\/election$/i);
+    if (electionGetMatch && req.method === 'GET') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const municipality = await getMunicipalityBySlug(electionGetMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      const active = await getActiveElection(municipality.id);
+      if (!active) return sendJson(res, 200, { ok: true, data: null });
+
+      const details = await getElectionDetails(active.id, municipality.id);
+
+      // Eigene Stimme des Users
+      const [myVote] = await dbPool.query(
+        `SELECT candidate_id FROM election_votes WHERE election_id = ? AND voter_id = ? LIMIT 1`,
+        [active.id, authUser.id]
+      );
+      const myCandidate = await dbPool.query(
+        `SELECT id, withdrawn_at FROM election_candidates WHERE election_id = ? AND user_id = ? LIMIT 1`,
+        [active.id, authUser.id]
+      );
+
+      return sendJson(res, 200, {
+        ok: true,
+        data: {
+          ...details,
+          my_vote: myVote[0]?.candidate_id || null,
+          my_candidacy: myCandidate[0]?.[0] || null,
+        },
+      });
+    }
+
+    // POST /api/game/municipality/:slug/election — Wahl ausrufen (Gemeinderat)
+    const electionOpenMatch = pathname.match(/^\/api\/game\/municipality\/([a-z0-9-]+)\/election$/i);
+    if (electionOpenMatch && req.method === 'POST') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const municipality = await getMunicipalityBySlug(electionOpenMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      const role = await getUserMunicipalityRole(authUser.id, municipality.id);
+      const isAdmin = isGlobalAdmin(authUser);
+      if (role !== MUNICIPALITY_ROLE_COUNCIL && !isAdmin) {
+        return sendJson(res, 403, { ok: false, error: 'Nur der Gemeinderat kann eine Wahl ausrufen' });
+      }
+
+      try {
+        const electionId = await openElection(municipality.id, isAdmin ? 'admin' : 'council_vote');
+        return sendJson(res, 200, { ok: true, data: { election_id: electionId } });
+      } catch (err) {
+        if (err.message === 'ELECTION_COOLDOWN') return sendJson(res, 429, { ok: false, error: 'Wahl erst in 14 Tagen wieder möglich' });
+        if (err.message === 'ELECTION_ALREADY_ACTIVE') return sendJson(res, 409, { ok: false, error: 'Es läuft bereits eine Wahl' });
+        throw err;
+      }
+    }
+
+    // POST /api/game/municipality/:slug/election/candidates — kandidieren
+    const electionCandidateMatch = pathname.match(/^\/api\/game\/municipality\/([a-z0-9-]+)\/election\/candidates$/i);
+    if (electionCandidateMatch && req.method === 'POST') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const municipality = await getMunicipalityBySlug(electionCandidateMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      const active = await getActiveElection(municipality.id);
+      if (!active) return sendJson(res, 404, { ok: false, error: 'Keine laufende Wahl' });
+      if (active.status !== 'candidates') return sendJson(res, 400, { ok: false, error: 'Kandidaturphase ist abgelaufen' });
+
+      try {
+        await registerCandidate(active.id, authUser.id, municipality.id);
+        return sendJson(res, 200, { ok: true });
+      } catch (err) {
+        const msgs = {
+          NOT_A_MEMBER: 'Du bist kein Mitglied dieser Gemeinde',
+          TOO_NEW: 'Du musst mindestens 7 Tage Mitglied sein um zu kandidieren',
+          ALREADY_WITHDRAWN: 'Du hast deine Kandidatur bereits zurückgezogen',
+          ALREADY_CANDIDATE: 'Du kandidierst bereits',
+          MAX_CANDIDATES: 'Maximale Anzahl Kandidaten erreicht (10)',
+        };
+        return sendJson(res, 400, { ok: false, error: msgs[err.message] || err.message });
+      }
+    }
+
+    // DELETE /api/game/municipality/:slug/election/candidates — Kandidatur zurückziehen
+    if (electionCandidateMatch && req.method === 'DELETE') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const municipality = await getMunicipalityBySlug(electionCandidateMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      const active = await getActiveElection(municipality.id);
+      if (!active || active.status !== 'candidates') return sendJson(res, 400, { ok: false, error: 'Nicht mehr in Kandidaturphase' });
+
+      try {
+        await withdrawCandidacy(active.id, authUser.id);
+        return sendJson(res, 200, { ok: true });
+      } catch (err) {
+        const msgs = { NOT_A_CANDIDATE: 'Du kandidierst nicht', ALREADY_WITHDRAWN: 'Bereits zurückgezogen' };
+        return sendJson(res, 400, { ok: false, error: msgs[err.message] || err.message });
+      }
+    }
+
+    // POST /api/game/municipality/:slug/election/vote — abstimmen
+    const electionVoteMatch = pathname.match(/^\/api\/game\/municipality\/([a-z0-9-]+)\/election\/vote$/i);
+    if (electionVoteMatch && req.method === 'POST') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const municipality = await getMunicipalityBySlug(electionVoteMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      const active = await getActiveElection(municipality.id);
+      if (!active) return sendJson(res, 404, { ok: false, error: 'Keine laufende Wahl' });
+      if (active.status !== 'voting') return sendJson(res, 400, { ok: false, error: 'Abstimmungsphase ist noch nicht gestartet' });
+
+      const body = await readJsonBody(req);
+      const candidateId = Number(body?.candidate_id || 0);
+      if (!candidateId) return sendJson(res, 422, { ok: false, error: 'candidate_id fehlt' });
+
+      try {
+        await castVote(active.id, authUser.id, candidateId, municipality.id);
+        return sendJson(res, 200, { ok: true });
+      } catch (err) {
+        const msgs = {
+          NOT_A_MEMBER: 'Du bist kein Mitglied',
+          TOO_NEW: 'Du musst mindestens 3 Tage Mitglied sein um zu wählen',
+          INVALID_CANDIDATE: 'Ungültiger Kandidat',
+          ALREADY_VOTED: 'Du hast bereits abgestimmt',
+        };
+        return sendJson(res, 400, { ok: false, error: msgs[err.message] || err.message });
+      }
+    }
+
+    // ── No-Confidence (Misstrauensvotum) ─────────────────────────────────────
+
+    // POST /api/game/municipality/:slug/no-confidence — Misstrauensvotum beantragen
+    const noConfidenceMatch = pathname.match(/^\/api\/game\/municipality\/([a-z0-9-]+)\/no-confidence$/i);
+    if (noConfidenceMatch && req.method === 'POST') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const municipality = await getMunicipalityBySlug(noConfidenceMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      const role = await getUserMunicipalityRole(authUser.id, municipality.id);
+      if (role !== MUNICIPALITY_ROLE_COUNCIL) {
+        return sendJson(res, 403, { ok: false, error: 'Nur Gemeinderat kann ein Misstrauensvotum beantragen' });
+      }
+
+      try {
+        const ncId = await openNoConfidenceVote(municipality.id, authUser.id);
+        return sendJson(res, 200, { ok: true, data: { no_confidence_id: ncId } });
+      } catch (err) {
+        const msgs = {
+          REQUEST_COOLDOWN: 'Du kannst erst in 30 Tagen wieder ein Misstrauensvotum beantragen',
+          ALREADY_OPEN: 'Es läuft bereits ein Misstrauensvotum',
+        };
+        return sendJson(res, 400, { ok: false, error: msgs[err.message] || err.message });
+      }
+    }
+
+    // POST /api/game/municipality/:slug/no-confidence/:id/vote — Rat stimmt zu
+    const noConfidenceVoteMatch = pathname.match(/^\/api\/game\/municipality\/([a-z0-9-]+)\/no-confidence\/([0-9]+)\/vote$/i);
+    if (noConfidenceVoteMatch && req.method === 'POST') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const municipality = await getMunicipalityBySlug(noConfidenceVoteMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      const role = await getUserMunicipalityRole(authUser.id, municipality.id);
+      if (role !== MUNICIPALITY_ROLE_COUNCIL) {
+        return sendJson(res, 403, { ok: false, error: 'Nur Gemeinderat kann abstimmen' });
+      }
+
+      const ncId = Number(noConfidenceVoteMatch[2]);
+      try {
+        const outcome = await voteNoConfidence(ncId, authUser.id, municipality.id);
+        return sendJson(res, 200, { ok: true, data: { outcome } });
+      } catch (err) {
+        if (err.message === 'ALREADY_VOTED') return sendJson(res, 400, { ok: false, error: 'Du hast bereits abgestimmt' });
+        throw err;
+      }
+    }
+
+    // POST /api/admin/municipality/:slug/force-replace-owner — Admin ersetzt BM sofort
+    const forceOwnerMatch = pathname.match(/^\/api\/admin\/municipality\/([a-z0-9-]+)\/force-replace-owner$/i);
+    if (forceOwnerMatch && req.method === 'POST') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser || !isGlobalAdmin(authUser)) return sendJson(res, 403, { ok: false, error: 'Kein Zugriff' });
+      const municipality = await getMunicipalityBySlug(forceOwnerMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      const body = await readJsonBody(req);
+      const newOwnerId = Number(body?.new_owner_id || 0);
+      if (!newOwnerId) return sendJson(res, 422, { ok: false, error: 'new_owner_id fehlt' });
+
+      const targetRole = await getUserMunicipalityRole(newOwnerId, municipality.id);
+      if (!targetRole || targetRole === MUNICIPALITY_ROLE_OBSERVER) {
+        return sendJson(res, 404, { ok: false, error: 'User ist kein aktives Mitglied' });
+      }
+
+      await promoteToOwner(municipality.id, newOwnerId);
+      return sendJson(res, 200, { ok: true, data: { new_owner_id: newOwnerId } });
     }
 
     // PUT /api/game/municipality/:slug/zone-settings

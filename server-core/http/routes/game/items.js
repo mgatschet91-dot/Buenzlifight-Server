@@ -23,6 +23,8 @@ const {
   formatGameItemRow,
 } = require('../../../game/building');
 
+const { touchMunicipalityActivity } = require('../../../game/municipality');
+
 const {
   ensureServerGeneratedRoomMap,
   refreshGameDataMapFromItems,
@@ -72,6 +74,9 @@ module.exports = function registerItemsRoutes(deps) {
       if (!roomCode) return sendJson(res, 422, { ok: false, error: 'roomCode ungültig' });
 
       if (req.method === 'GET') {
+        const authUser = await getAuthenticatedUser(req);
+        if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+
         const rawCx = requestUrl.searchParams.get('cx');
         const rawCy = requestUrl.searchParams.get('cy');
         const rawChunkSize = requestUrl.searchParams.get('chunk_size');
@@ -248,6 +253,7 @@ module.exports = function registerItemsRoutes(deps) {
       );
       invalidateRoomItemsCache(municipality.id, roomCode);
       await refreshGameDataMapFromItems(municipality, roomCode, 'server-core-live-v1');
+      touchMunicipalityActivity(municipality.id, authUser.id).catch(() => {});
       return sendJson(res, 200, { ok: true, data: result });
     }
 
@@ -255,6 +261,9 @@ module.exports = function registerItemsRoutes(deps) {
     // Laravel-kompatible Aliase für bestehendes mapGame
     const legacyItemsGetMatch = pathname.match(/^\/api\/game\/municipality\/([a-z0-9-]+)\/items\/([a-z0-9-]+)$/i);
     if (legacyItemsGetMatch && req.method === 'GET') {
+      const legacyAuthUser = await getAuthenticatedUser(req);
+      if (!legacyAuthUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+
       req.url = `/api/game/items/${legacyItemsGetMatch[1]}/${legacyItemsGetMatch[2]}`;
       // Rekursion vermeiden: direkt gleich behandeln
       const municipality = await getMunicipalityBySlug(legacyItemsGetMatch[1].toLowerCase());

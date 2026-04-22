@@ -36,8 +36,9 @@ function createSocketIOServer(httpServer) {
       credentials: true,
     },
     transports: ['websocket', 'polling'],
-    pingInterval: 10000,
-    pingTimeout: 8000,
+    pingInterval: 25000,
+    pingTimeout: 60000,
+    maxHttpBufferSize: 10 * 1024 * 1024, // 10MB fuer grosse Grid-Payloads
   });
 
   io.on('connection', (socket) => {

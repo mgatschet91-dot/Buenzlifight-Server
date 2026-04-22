@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const https = require('https');
 const { sendJson, readJsonBody, getBearerToken } = require('../../infra/http');
 const { logInfo } = require('../../infra/logger');
 const { dbPool, ensureDbEnabled } = require('../../infra/db');
@@ -17,7 +18,26 @@ const {
   GLOBAL_ROLE_USER, GLOBAL_ROLE_ADMINISTRATOR,
   TOKEN_TTL_HOURS, TOKEN_TTL_HOURS_REMEMBER,
   MUNICIPALITY_MEMBER_LIMIT, MUNICIPALITY_ROLE_OWNER, MUNICIPALITY_ROLE_CITIZEN, XP_LEVEL_CAP,
+  STEAM_WEB_API_KEY, STEAM_APP_ID,
 } = require('../../config/constants');
+
+function verifySteamTicket(ticket) {
+  return new Promise((resolve, reject) => {
+    const url = `https://api.steampowered.com/ISteamUserAuth/AuthenticateUserTicket/v1/?key=${STEAM_WEB_API_KEY}&appid=${STEAM_APP_ID}&ticket=${ticket}`;
+    https.get(url, res => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const params = json?.response?.params;
+          if (params?.result === 'OK') resolve(params.steamid);
+          else reject(new Error(params?.error || 'Steam Verifikation fehlgeschlagen'));
+        } catch { reject(new Error('Ungültige Steam-Antwort')); }
+      });
+    }).on('error', reject);
+  });
+}
 const { validateEmail } = require('../../shared/helpers');
 const {
   getMunicipalityById, getUserMunicipalityRole,
@@ -380,6 +400,163 @@ module.exports = function registerAuthRoutes(deps) {
         [user.id]
       );
       return sendJson(res, 200, { ok: true, history: rows });
+    }
+
+    // ── Steam-Login / Auto-Register ──────────────────────────────────────────
+    if (req.method === 'POST' && pathname === '/api/auth/steam') {
+      ensureDbEnabled();
+      if (!STEAM_WEB_API_KEY) return sendJson(res, 503, { ok: false, error: 'Steam-Auth nicht konfiguriert' });
+      const body = await readJsonBody(req);
+      const ticket = (body.ticket || '').toString().trim();
+      const steamName = (body.steamName || '').toString().trim().slice(0, 32);
+      if (!ticket) return sendJson(res, 422, { ok: false, error: 'Kein Steam-Ticket' });
+
+      let steamId;
+      try {
+        steamId = await verifySteamTicket(ticket);
+      } catch (e) {
+        logInfo('AUTH', `Steam-Ticket ungültig: ${e.message}`);
+        return sendJson(res, 401, { ok: false, error: 'Steam-Verifikation fehlgeschlagen — ist Steam gestartet?' });
+      }
+
+      if (!/^\d{17}$/.test(steamId)) return sendJson(res, 401, { ok: false, error: 'Ungültige SteamID von Steam erhalten' });
+
+      // Existierenden User suchen
+      const [[existing]] = await dbPool.query(
+        'SELECT id, nickname, email, is_active, is_banned, steam_setup_done, municipality_id FROM users WHERE steam_id = ? LIMIT 1',
+        [steamId]
+      );
+      if (existing) {
+        if (!existing.is_active) return sendJson(res, 401, { ok: false, error: 'Account deaktiviert' });
+        if (existing.is_banned)  return sendJson(res, 403, { ok: false, error: 'Dein Account wurde gesperrt.' });
+        // Setup noch nicht abgeschlossen ODER keine Gemeinde → Setup-Screen zeigen
+        if (!existing.steam_setup_done || !existing.municipality_id) {
+          const setupToken = signToken({ steamSetup: true, steamId, steamName, existingId: existing.id, existingNickname: existing.nickname }, 5 / 60);
+          return sendJson(res, 200, { ok: false, newUser: true, isExisting: true, setupToken, steamName: existing.nickname });
+        }
+        await revokeAllUserSessions(existing.id);
+        const token = signToken({ sub: existing.id, email: existing.email || '', nickname: existing.nickname, rem: 1 }, TOKEN_TTL_HOURS_REMEMBER);
+        await createAuthSession(existing.id, token, req, TOKEN_TTL_HOURS_REMEMBER);
+        logInfo('AUTH', `Steam-Login: ${existing.nickname} (ID ${existing.id}, Steam ${steamId})`);
+        return sendJson(res, 200, { ok: true, token, user: { id: existing.id, nickname: existing.nickname } });
+      }
+
+      // Neuer User — Setup-Token zurückgeben, Account noch nicht anlegen
+      const setupToken = signToken({ steamSetup: true, steamId, steamName }, 5 / 60); // 5 Minuten
+      return sendJson(res, 200, { ok: false, newUser: true, setupToken, steamName });
+    }
+
+    // ── Steam-Setup: Neuen Account fertig anlegen ────────────────────────────
+    if (req.method === 'POST' && pathname === '/api/auth/steam/setup') {
+      ensureDbEnabled();
+      const body = await readJsonBody(req);
+      const setupToken = (body.setupToken || '').toString().trim();
+      const username = (body.username || '').toString().trim().slice(0, 32);
+      const municipalitySlug = (body.municipalitySlug || '').toString().trim();
+      const newMunicipalityName = (body.newMunicipalityName || '').toString().trim().slice(0, 100);
+
+      if (!setupToken) return sendJson(res, 422, { ok: false, error: 'Setup-Token fehlt' });
+      if (!username || username.length < 2) return sendJson(res, 422, { ok: false, error: 'Username muss mindestens 2 Zeichen haben' });
+
+      const payload = verifyToken(setupToken);
+      if (!payload || !payload.steamSetup) return sendJson(res, 401, { ok: false, error: 'Setup-Token ungültig oder abgelaufen — bitte neu anmelden' });
+
+      const { steamId, existingId } = payload;
+      if (!/^\d{17}$/.test(steamId)) return sendJson(res, 401, { ok: false, error: 'Ungültige SteamID' });
+
+      // Username-Verfügbarkeit prüfen (ausser bei eigenem bestehenden Account)
+      const [[takenNick]] = await dbPool.query(
+        'SELECT id FROM users WHERE LOWER(nickname) = LOWER(?) AND id != ? LIMIT 1',
+        [username, existingId || 0]
+      );
+      if (takenNick) return sendJson(res, 409, { ok: false, error: 'Dieser Username ist bereits vergeben' });
+
+      // Gemeinde auflösen oder neu gründen
+      const assignMunicipality = async (userId) => {
+        let muni = null;
+        let role = MUNICIPALITY_ROLE_CITIZEN;
+
+        if (newMunicipalityName && newMunicipalityName.length >= 2) {
+          // Neue Gemeinde gründen
+          const slug = newMunicipalityName
+            .toLowerCase()
+            .replace(/[äàâ]/g, 'ae').replace(/[öòô]/g, 'oe').replace(/[üùû]/g, 'ue')
+            .replace(/[éèêë]/g, 'e').replace(/[íìîï]/g, 'i').replace(/[ß]/g, 'ss')
+            .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+          const [[slugTaken]] = await dbPool.query('SELECT id FROM municipalities WHERE slug = ? LIMIT 1', [slug]);
+          if (slugTaken) throw Object.assign(new Error('Eine Gemeinde mit diesem Namen existiert bereits'), { statusCode: 409 });
+          const [insertMun] = await dbPool.query(
+            `INSERT INTO municipalities (name, slug, canton_code, canton_name, is_active, is_user_created) VALUES (?, ?, '', '', 1, 1)`,
+            [newMunicipalityName, slug]
+          );
+          await dbPool.query(
+            `INSERT IGNORE INTO municipality_stats (municipality_id, shield_active_until, treasury) VALUES (?, DATE_ADD(NOW(), INTERVAL 7 DAY), 15000)`,
+            [insertMun.insertId]
+          );
+          muni = { id: insertMun.insertId, name: newMunicipalityName, slug };
+          role = MUNICIPALITY_ROLE_OWNER;
+        } else if (municipalitySlug) {
+          const [[bySlug]] = await dbPool.query('SELECT id, slug, name FROM municipalities WHERE slug = ? LIMIT 1', [municipalitySlug]);
+          muni = bySlug || null;
+        }
+        if (!muni) {
+          const [[defaultMuni]] = await dbPool.query(`SELECT id, slug, name FROM municipalities WHERE slug IN ('zurich','zürich') LIMIT 1`);
+          muni = defaultMuni || (await dbPool.query(`SELECT id, slug, name FROM municipalities ORDER BY id ASC LIMIT 1`))[0][0];
+        }
+        if (muni) {
+          await dbPool.query(
+            `INSERT INTO municipality_memberships (municipality_id, user_id, role) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE role = VALUES(role)`,
+            [muni.id, userId, role]
+          );
+          await dbPool.query('UPDATE users SET municipality_id = ? WHERE id = ?', [muni.id, userId]);
+          await syncMunicipalityMemberships(muni.id);
+        }
+        return muni;
+      };
+
+      let userId, userEmail;
+
+      if (existingId) {
+        // Bestehenden Account aktualisieren
+        const [[existingUser]] = await dbPool.query('SELECT id, email FROM users WHERE id = ? AND steam_id = ? LIMIT 1', [existingId, steamId]);
+        if (!existingUser) return sendJson(res, 401, { ok: false, error: 'Account nicht gefunden' });
+        await dbPool.query('UPDATE users SET nickname = ?, steam_setup_done = 1 WHERE id = ?', [username, existingId]);
+        userId = existingId;
+        userEmail = existingUser.email || `steam_${steamId}@steam.local`;
+        let muni;
+        try { muni = await assignMunicipality(userId); }
+        catch (e) {
+          if (e.statusCode === 409) return sendJson(res, 409, { ok: false, error: e.message });
+          logInfo('AUTH', `Steam-Setup update: Gemeinde fehlgeschlagen: ${e.message}`);
+        }
+        logInfo('AUTH', `Steam-Setup (update): ${username} (ID ${userId}, Gemeinde: ${muni?.slug || 'keine'})`);
+      } else {
+        // Neuen Account anlegen
+        const fakeEmail = `steam_${steamId}@steam.local`;
+        const salt = crypto.randomBytes(16).toString('hex');
+        const pwHash = hashPassword(crypto.randomBytes(32).toString('hex'), salt);
+        const newUuid = crypto.randomUUID();
+        const [insertResult] = await dbPool.query(
+          `INSERT INTO users (uuid, nickname, email, password_hash, password_salt, steam_id, steam_setup_done, is_active)
+           VALUES (?, ?, ?, ?, ?, ?, 1, 1)`,
+          [newUuid, username, fakeEmail, pwHash, salt, steamId]
+        );
+        userId = insertResult.insertId;
+        userEmail = fakeEmail;
+        await syncUserGlobalRoleFromRank(userId, GLOBAL_ROLE_USER);
+        let muni;
+        try { muni = await assignMunicipality(userId); }
+        catch (e) {
+          if (e.statusCode === 409) return sendJson(res, 409, { ok: false, error: e.message });
+          logInfo('AUTH', `Steam-Setup new: Gemeinde fehlgeschlagen: ${e.message}`);
+        }
+        logInfo('AUTH', `Steam-Setup (new): ${username} (ID ${userId}, Steam ${steamId}, Gemeinde: ${muni?.slug || 'keine'})`);
+      }
+
+      await revokeAllUserSessions(userId);
+      const token = signToken({ sub: userId, email: userEmail, nickname: username, rem: 1 }, TOKEN_TTL_HOURS_REMEMBER);
+      await createAuthSession(userId, token, req, TOKEN_TTL_HOURS_REMEMBER);
+      return sendJson(res, 200, { ok: true, token, user: { id: userId, nickname: username } });
     }
 
     if (req.method === 'POST' && pathname === '/api/auth/change-password') {
