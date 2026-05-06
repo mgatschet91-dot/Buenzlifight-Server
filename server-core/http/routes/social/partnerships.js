@@ -20,6 +20,10 @@ const {
   listPartnershipRequestsForMunicipality,
   getPartnershipRequestById,
   toPartnershipRequestDto,
+  investInPartnership,
+  executeDiplomaticAction,
+  getActionCooldowns,
+  computeExportCapacity,
 } = require('../../../game/partnerships');
 
 const { createUserNotification } = require('../../../game/notifications');
@@ -568,6 +572,111 @@ module.exports = function registerPartnershipRoutes(deps) {
           message: newStatus === 'accepted' ? 'Anfrage akzeptiert' : 'Anfrage abgelehnt',
         },
       });
+    }
+
+    // ── INVEST IN PARTNERSHIP ──────────────────────────────────────────────────
+    // POST /api/game/municipality/:slug/partnerships/:partnerSlug/invest
+    const investMatch = pathname.match(
+      /^\/api\/game\/municipality\/([a-z0-9-]+)\/partnerships\/([a-z0-9-]+)\/invest$/i
+    );
+    if (investMatch && req.method === 'POST') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { success: false, error: 'Nicht eingeloggt' });
+
+      const municipality = await getMunicipalityBySlug(investMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { success: false, error: 'Gemeinde nicht gefunden' });
+
+      const owner = await getMunicipalityOwner(municipality.id);
+      if (!owner || Number(owner.id) !== Number(authUser.id))
+        return sendJson(res, 403, { success: false, error: 'Keine Berechtigung' });
+
+      const partner = await getMunicipalityBySlug(investMatch[2].toLowerCase());
+      if (!partner) return sendJson(res, 404, { success: false, error: 'Partner-Gemeinde nicht gefunden' });
+
+      const body = await readJsonBody(req);
+      const amount = Math.max(0, Math.round(Number(body?.amount) || 0));
+      if (amount <= 0) return sendJson(res, 400, { success: false, error: 'Betrag muss grösser als 0 sein' });
+
+      try {
+        const tierProgress = await investInPartnership(municipality.id, partner.id, amount);
+        return sendJson(res, 200, { success: true, data: { invested: amount, tier_progress: tierProgress } });
+      } catch (err) {
+        return sendJson(res, 400, { success: false, error: err.message });
+      }
+    }
+
+    // ── DIPLOMATISCHE AKTIONEN ─────────────────────────────────────────────────
+    // POST /api/game/municipality/:slug/partnerships/:partnerSlug/action
+    const actionMatch = pathname.match(
+      /^\/api\/game\/municipality\/([a-z0-9-]+)\/partnerships\/([a-z0-9-]+)\/action$/i
+    );
+    if (actionMatch && req.method === 'POST') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { success: false, error: 'Nicht eingeloggt' });
+
+      const municipality = await getMunicipalityBySlug(actionMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { success: false, error: 'Gemeinde nicht gefunden' });
+
+      const owner = await getMunicipalityOwner(municipality.id);
+      if (!owner || Number(owner.id) !== Number(authUser.id))
+        return sendJson(res, 403, { success: false, error: 'Keine Berechtigung' });
+
+      const partner = await getMunicipalityBySlug(actionMatch[2].toLowerCase());
+      if (!partner) return sendJson(res, 404, { success: false, error: 'Partner-Gemeinde nicht gefunden' });
+
+      const body = await readJsonBody(req);
+      const actionType = String(body?.action_type || '').trim();
+      if (!actionType) return sendJson(res, 400, { success: false, error: 'action_type fehlt' });
+
+      try {
+        const cooldowns = await executeDiplomaticAction(municipality.id, partner.id, actionType);
+        return sendJson(res, 200, { success: true, data: { cooldowns } });
+      } catch (err) {
+        return sendJson(res, 400, { success: false, error: err.message });
+      }
+    }
+
+    // GET /api/game/municipality/:slug/partnerships/:partnerSlug/action
+    if (actionMatch && req.method === 'GET') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { success: false, error: 'Nicht eingeloggt' });
+
+      const municipality = await getMunicipalityBySlug(actionMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { success: false, error: 'Gemeinde nicht gefunden' });
+
+      const partner = await getMunicipalityBySlug(actionMatch[2].toLowerCase());
+      if (!partner) return sendJson(res, 404, { success: false, error: 'Partner-Gemeinde nicht gefunden' });
+
+      try {
+        const cooldowns = await getActionCooldowns(municipality.id, partner.id);
+        return sendJson(res, 200, { success: true, data: { cooldowns } });
+      } catch (err) {
+        return sendJson(res, 400, { success: false, error: err.message });
+      }
+    }
+
+    // ── EXPORT-KAPAZITÄT ───────────────────────────────────────────────────────
+    // GET /api/game/municipality/:slug/partnerships/export-capacity
+    const exportCapMatch = pathname.match(
+      /^\/api\/game\/municipality\/([a-z0-9-]+)\/partnerships\/export-capacity$/i
+    );
+    if (exportCapMatch && req.method === 'GET') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { success: false, error: 'Nicht eingeloggt' });
+
+      const municipality = await getMunicipalityBySlug(exportCapMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { success: false, error: 'Gemeinde nicht gefunden' });
+
+      try {
+        const capacity = await computeExportCapacity(municipality.id);
+        return sendJson(res, 200, { success: true, data: capacity });
+      } catch (err) {
+        return sendJson(res, 400, { success: false, error: err.message });
+      }
     }
 
   };

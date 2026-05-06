@@ -73,10 +73,20 @@ async function handleVehicleParked(municipalityId, tileX, tileY, slot) {
 // ── Gebühr beim Wegfahren buchen ──────────────────────────────────────────────
 // Berechnet Parkdauer (parked_at → jetzt), multipliziert mit Stundenrate.
 // Anti-Exploit: Einnahmen nur bis zum Bedarf der Stadt (jobs × 0.30 + pop × 0.10).
+// Gebühr für ein einzelnes Fahrzeug berechnen (ohne DB-Schreibzugriff).
+// Gibt netRevenue zurück oder 0 wenn kostenlos / keine Dauer.
+async function _calcFee(municipalityId, tileX, tileY, slot, parkedAt, isFree, feeRate, demand, count) {
+  if (isFree) return 0;
+  const durationH = Math.max(0, (Date.now() - new Date(parkedAt).getTime()) / 3600000);
+  if (durationH <= 0) return 0;
+  const gross    = durationH * Number(feeRate);
+  const fraction = Math.min(1, demand / Math.max(1, count));
+  return Math.max(1, Math.round(gross * fraction * 0.70));
+}
+
 async function handleVehicleLeft(municipalityId, tileX, tileY, slot) {
   ensureDbEnabled();
   try {
-    // Parkzeit und Konfiguration laden
     const [[vehicle]] = await dbPool.query(
       `SELECT pv.parked_at,
               COALESCE(pc.is_free, 0)    AS is_free,
@@ -88,49 +98,32 @@ async function handleVehicleLeft(municipalityId, tileX, tileY, slot) {
        WHERE pv.municipality_id = ? AND pv.tile_x = ? AND pv.tile_y = ? AND pv.slot = ?`,
       [municipalityId, tileX, tileY, slot]
     );
+    if (!vehicle || vehicle.is_free) return;
 
-    if (!vehicle || vehicle.is_free) return; // kostenlos → nichts buchen
-
-    const parkedAt  = new Date(vehicle.parked_at);
-    const nowMs     = Date.now();
-    const durationH = Math.max(0, (nowMs - parkedAt.getTime()) / 3600000); // Stunden
-    if (durationH <= 0) return;
-
-    const grossRevenue = durationH * Number(vehicle.fee_rate); // CHF (dezimal)
-
-    // Anti-Exploit: Anteil prüfen
     const [[stats]] = await dbPool.query(
-      `SELECT COALESCE(population, 0) AS population, COALESCE(jobs, 0) AS jobs
-       FROM municipality_stats WHERE municipality_id = ?`,
-      [municipalityId]
+      `SELECT COALESCE(population,0) AS population, COALESCE(jobs,0) AS jobs
+       FROM municipality_stats WHERE municipality_id = ?`, [municipalityId]
     );
-    const demand = Math.floor((Number(stats?.jobs) || 0) * 0.30 + (Number(stats?.population) || 0) * 0.10);
-
-    // Wie viele Autos parken gerade (inkl. dieses)?
+    const demand = Math.floor((Number(stats?.jobs)||0)*0.30 + (Number(stats?.population)||0)*0.10);
     const [[{ parkedCount }]] = await dbPool.query(
-      `SELECT COUNT(*) AS parkedCount FROM parked_vehicles WHERE municipality_id = ?`,
-      [municipalityId]
+      `SELECT COUNT(*) AS parkedCount FROM parked_vehicles WHERE municipality_id = ?`, [municipalityId]
     );
-    const count = Math.max(1, Number(parkedCount) || 1);
+    const netRevenue = await _calcFee(
+      municipalityId, tileX, tileY, slot,
+      vehicle.parked_at, vehicle.is_free, vehicle.fee_rate,
+      demand, Number(parkedCount) || 1
+    );
+    if (netRevenue <= 0) return;
 
-    // Anteil dieses Autos am Demand (max 1.0), × 70 % zahlen tatsächlich
-    const fraction      = Math.min(1, demand / count);
-    const netRevenue    = Math.round(grossRevenue * fraction * 0.70);
-    if (netRevenue < 1) return; // unter 1 CHF → nicht buchen
-
-    // Treasury erhöhen
     await dbPool.query(
       `UPDATE municipality_stats SET treasury = treasury + ? WHERE municipality_id = ?`,
       [netRevenue, municipalityId]
     );
-
-    // Ledger-Buchung
     await _ledger(municipalityId, 'parking_fee', netRevenue, {
       tileX, tileY, slot,
-      durationMinutes: Math.round(durationH * 60),
-      feeRateCHF:      Number(vehicle.fee_rate),
-      grossCHF:        Math.round(grossRevenue * 100) / 100,
-      netCHF:          netRevenue,
+      durationMinutes: Math.round((Date.now() - new Date(vehicle.parked_at).getTime()) / 60000),
+      feeRateCHF: Number(vehicle.fee_rate),
+      netCHF: netRevenue,
     });
   } catch (err) {
     logError('PARKING', 'handleVehicleLeft Fehler', { error: err?.message });
@@ -138,22 +131,52 @@ async function handleVehicleLeft(municipalityId, tileX, tileY, slot) {
 }
 
 // ── Ablauf-Tick: Abgelaufene Fahrzeuge rauswerfen (alle 60 s) ─────────────────
+// Schreibt pro Gemeinde EINEN gebündelten Ledger-Eintrag statt einen pro Auto.
 async function runParkingExpiryTick(broadcastToRoom) {
   ensureDbEnabled();
   try {
-    // Alle Fahrzeuge die ihre leave_after_seconds überschritten haben
     const [expired] = await dbPool.query(
-      `SELECT id, municipality_id, tile_x, tile_y, slot
-       FROM parked_vehicles
-       WHERE parked_at + INTERVAL leave_after_seconds SECOND < NOW()`
+      `SELECT pv.id, pv.municipality_id, pv.tile_x, pv.tile_y, pv.slot, pv.parked_at,
+              COALESCE(pc.is_free, 0)    AS is_free,
+              COALESCE(pc.fee_rate, 3.0) AS fee_rate
+       FROM parked_vehicles pv
+       LEFT JOIN parking_config pc
+         ON pc.municipality_id = pv.municipality_id
+        AND pc.tile_x = pv.tile_x AND pc.tile_y = pv.tile_y
+       WHERE pv.parked_at + INTERVAL pv.leave_after_seconds SECOND < NOW()`
     );
+    if (expired.length === 0) return;
+
+    // Anti-Exploit-Daten einmal pro Gemeinde laden
+    const municipalityIds = [...new Set(expired.map(v => v.municipality_id))];
+    const demandMap = new Map();
+    for (const mid of municipalityIds) {
+      const [[stats]] = await dbPool.query(
+        `SELECT COALESCE(population,0) AS population, COALESCE(jobs,0) AS jobs,
+                (SELECT COUNT(*) FROM parked_vehicles WHERE municipality_id = ?) AS parkedCount
+         FROM municipality_stats WHERE municipality_id = ?`, [mid, mid]
+      );
+      const demand = Math.floor((Number(stats?.jobs)||0)*0.30 + (Number(stats?.population)||0)*0.10);
+      demandMap.set(mid, { demand, count: Math.max(1, Number(stats?.parkedCount)||1) });
+    }
+
+    // Gebühren berechnen + IDs sammeln
+    const revenueByMunicipality = new Map(); // municipalityId → { total, cars }
+    const ids = [];
     for (const v of expired) {
       try {
-        await handleVehicleLeft(v.municipality_id, v.tile_x, v.tile_y, v.slot);
-        await dbPool.query(
-          `DELETE FROM parked_vehicles WHERE id = ?`,
-          [v.id]
+        const { demand, count } = demandMap.get(v.municipality_id);
+        const net = await _calcFee(
+          v.municipality_id, v.tile_x, v.tile_y, v.slot,
+          v.parked_at, v.is_free, v.fee_rate, demand, count
         );
+        if (net > 0) {
+          const entry = revenueByMunicipality.get(v.municipality_id) || { total: 0, cars: 0 };
+          entry.total += net;
+          entry.cars  += 1;
+          revenueByMunicipality.set(v.municipality_id, entry);
+        }
+        ids.push(v.id);
         if (broadcastToRoom) {
           broadcastToRoom(v.municipality_id, 'vehicle-left-parking', {
             tileX: v.tile_x, tileY: v.tile_y, slot: v.slot,
@@ -162,6 +185,22 @@ async function runParkingExpiryTick(broadcastToRoom) {
       } catch (err) {
         logError('PARKING', 'Ablauf-Tick Einzelfahrzeug Fehler', { error: err?.message, id: v.id });
       }
+    }
+
+    // Fahrzeuge löschen
+    if (ids.length > 0) {
+      await dbPool.query(
+        `DELETE FROM parked_vehicles WHERE id IN (${ids.map(() => '?').join(',')})`, ids
+      );
+    }
+
+    // Pro Gemeinde: Treasury + ein gebündelter Ledger-Eintrag
+    for (const [mid, { total, cars }] of revenueByMunicipality) {
+      await dbPool.query(
+        `UPDATE municipality_stats SET treasury = treasury + ? WHERE municipality_id = ?`,
+        [total, mid]
+      );
+      await _ledger(mid, 'parking_fee', total, { cars, netCHF: total });
     }
   } catch (err) {
     logError('PARKING', 'runParkingExpiryTick Fehler', { error: err?.message });

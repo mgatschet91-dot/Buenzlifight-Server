@@ -15,6 +15,7 @@ const {
   deleteRoomItems,
   importRoomItems,
   syncRoomItems,
+  loadRoomStats,
 } = require('../../../game/rooms');
 
 const { invalidateRoomItemsCache } = require('../../../jobs/intervals');
@@ -276,9 +277,9 @@ module.exports = function registerItemsRoutes(deps) {
       const isLegacyChunkRequest = legacyRawCx !== null && legacyRawCy !== null;
       const isLegacyMetaOnly = requestUrl.searchParams.get('meta_only') === '1';
 
-      await ensureServerGeneratedRoomMap(municipality, roomCode);
-      // Teure Ticks nur beim Full-Load (nicht bei Chunk- oder Meta-Only-Requests)
+      // Chunk-Requests: teure Full-Scans überspringen (jeder Chunk würde sonst alle Items laden)
       if (!isLegacyChunkRequest && !isLegacyMetaOnly) {
+        await ensureServerGeneratedRoomMap(municipality, roomCode);
         await runServerDisasterTick(municipality.id, roomCode);
         await runServerBuildingUpgradeTick(municipality.id, roomCode);
       }
@@ -286,7 +287,10 @@ module.exports = function registerItemsRoutes(deps) {
       const roomState = toJsonValue(room?.game_state);
       const isNavigatorPublic = Boolean(roomCode.startsWith('PUB') || roomState?.navigator_public === true);
       const effectiveCityName = String(room?.city_name || municipality.name || roomCode);
-      const rawStats = await recomputeAuthoritativePopulationAndJobs(municipality.id, roomCode);
+      // Chunk-Requests: gecachte Stats verwenden statt alle Items neu zu scannen
+      const rawStats = (isLegacyChunkRequest || isLegacyMetaOnly)
+        ? (await loadRoomStats(municipality.id, roomCode) || {})
+        : await recomputeAuthoritativePopulationAndJobs(municipality.id, roomCode);
       const version = await getRoomItemVersion(municipality.id, roomCode);
       const mapRow = await getGameMapForMunicipality(municipality.id);
       const effectiveGridSize = isNavigatorPublic

@@ -37,6 +37,23 @@ module.exports = function registerMessengerHandlers(socket, io, context) {
         [conversationId, state.socketAuthUserId]
       );
       if (partRows.length === 0) return;
+
+      // Block-Check: Empfänger hat Sender geblockt?
+      const [otherParts] = await dbPool.query(
+        'SELECT user_id FROM user_messenger_participants WHERE conversation_id = ? AND user_id != ?',
+        [conversationId, state.socketAuthUserId]
+      );
+      for (const other of otherParts) {
+        const [blockRows] = await dbPool.query(
+          'SELECT id FROM user_blocks WHERE blocker_id = ? AND blocked_id = ? LIMIT 1',
+          [other.user_id, state.socketAuthUserId]
+        );
+        if (blockRows.length > 0) {
+          socket.emit('messenger-error', { code: 'BLOCKED', message: 'Dieser Spieler hat dich blockiert.' });
+          return;
+        }
+      }
+
       const [ins] = await dbPool.query(
         'INSERT INTO user_messenger_messages (conversation_id, sender_id, message) VALUES (?, ?, ?)',
         [conversationId, state.socketAuthUserId, text]
@@ -217,12 +234,77 @@ module.exports = function registerMessengerHandlers(socket, io, context) {
     }
   });
 
+  socket.on('messenger-block', async (data = {}) => {
+    if (rateLimiter('messenger-block')) return;
+    if (!state.socketAuthUserId) return;
+    const targetId = Number(data.userId || 0);
+    if (!targetId || targetId === state.socketAuthUserId) return;
+    try {
+      const { dbPool } = require('../../../infra/db');
+      await dbPool.query(
+        'INSERT IGNORE INTO user_blocks (blocker_id, blocked_id) VALUES (?, ?)',
+        [state.socketAuthUserId, targetId]
+      );
+      socket.emit('messenger-block-result', { userId: targetId, blocked: true });
+    } catch (err) {
+      logError('MESSENGER', 'Fehler beim Blockieren', { error: err?.message });
+    }
+  });
+
+  socket.on('messenger-unblock', async (data = {}) => {
+    if (!state.socketAuthUserId) return;
+    const targetId = Number(data.userId || 0);
+    if (!targetId) return;
+    try {
+      const { dbPool } = require('../../../infra/db');
+      await dbPool.query(
+        'DELETE FROM user_blocks WHERE blocker_id = ? AND blocked_id = ?',
+        [state.socketAuthUserId, targetId]
+      );
+      socket.emit('messenger-block-result', { userId: targetId, blocked: false });
+    } catch (err) {
+      logError('MESSENGER', 'Fehler beim Entblockieren', { error: err?.message });
+    }
+  });
+
+  socket.on('messenger-load-blocks', async () => {
+    if (!state.socketAuthUserId) return;
+    try {
+      const { dbPool } = require('../../../infra/db');
+      const [rows] = await dbPool.query(
+        `SELECT ub.blocked_id AS userId, u.nickname AS name
+         FROM user_blocks ub
+         JOIN users u ON u.id = ub.blocked_id
+         WHERE ub.blocker_id = ?
+         ORDER BY u.nickname ASC`,
+        [state.socketAuthUserId]
+      );
+      socket.emit('messenger-blocks-list', { blocks: rows.map(r => ({ userId: r.userId, name: r.name })) });
+    } catch (err) {
+      logError('MESSENGER', 'Fehler beim Laden der Blockliste', { error: err?.message });
+    }
+  });
+
   socket.on('messenger-start-chat', async (data = {}) => {
     if (!state.socketAuthUserId) return;
     const friendId = Number(data.friendId || 0);
     if (!friendId) return;
     try {
       const { dbPool } = require('../../../infra/db');
+
+      // Block-Check in beide Richtungen
+      const [blockRows] = await dbPool.query(
+        `SELECT id FROM user_blocks
+         WHERE (blocker_id = ? AND blocked_id = ?)
+            OR (blocker_id = ? AND blocked_id = ?)
+         LIMIT 1`,
+        [state.socketAuthUserId, friendId, friendId, state.socketAuthUserId]
+      );
+      if (blockRows.length > 0) {
+        socket.emit('messenger-error', { code: 'BLOCKED', message: 'Diese Konversation kann nicht geöffnet werden.' });
+        return;
+      }
+
       const [convRows] = await dbPool.query(
         `SELECT p1.conversation_id FROM user_messenger_participants p1
          INNER JOIN user_messenger_participants p2 ON p1.conversation_id = p2.conversation_id
@@ -335,6 +417,7 @@ module.exports = function registerMessengerHandlers(socket, io, context) {
   });
 
   socket.on('messenger-search', async (data = {}) => {
+    if (rateLimiter('messenger-search')) return;
     if (!state.socketAuthUserId) return;
     const query = String(data.query || '').trim().slice(0, 50);
     if (query.length < 2) { socket.emit('messenger-search-results', { results: [] }); return; }

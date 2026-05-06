@@ -1,0 +1,15 @@
+"appbuild"
+{
+    "appid"         "4563360"
+    "desc"          "BuenzliFight Windows Build"
+    "buildoutput"   "..\steamworks\output\"
+    "contentroot"   ""
+    "setlive"       ""
+    "preview"       "0"
+    "local"         ""
+
+    "depots"
+    {
+        "4563361"   "..\steamworks\depot_content.vdf"
+    }
+}

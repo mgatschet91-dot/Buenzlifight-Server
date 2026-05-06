@@ -63,6 +63,8 @@ module.exports = function registerMunicipalityChatRoutes(deps) {
               id: Number(municipality.id),
               name: municipality.name,
               slug: municipality.slug,
+              canton_code: municipality.canton_code || null,
+              canton_name: municipality.canton_name || null,
             },
           },
         });

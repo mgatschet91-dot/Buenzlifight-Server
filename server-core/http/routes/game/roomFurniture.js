@@ -23,7 +23,7 @@ module.exports = function registerRoomFurnitureRoutes(_deps) {
       }
 
       const [rows] = await dbPool.query(
-        `SELECT id, item_code, x, z, floor_level, facing_idx, wy FROM room_furniture WHERE user_id = ? ORDER BY id ASC`,
+        `SELECT id, item_code, x, z, floor_level, facing_idx, wy, pair_id FROM room_furniture WHERE user_id = ? ORDER BY id ASC`,
         [targetId]
       );
       return sendJson(res, 200, { ok: true, data: { placements: rows } });
@@ -43,14 +43,15 @@ module.exports = function registerRoomFurnitureRoutes(_deps) {
       const floorLevel = parseInt(body.floor_level ?? 0, 10);
       const facingIdx = parseInt(body.facing_idx ?? body.facingIdx ?? 0, 10);
       const wy       = body.wy != null ? parseFloat(body.wy) : null;
+      const pairId   = body.pair_id != null ? parseInt(body.pair_id, 10) : null;
 
       if (!itemCode || isNaN(x) || isNaN(z)) {
         return sendJson(res, 422, { ok: false, error: 'item_code, x, z erforderlich' });
       }
 
       const [result] = await dbPool.query(
-        `INSERT INTO room_furniture (user_id, item_code, x, z, floor_level, facing_idx, wy) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [user.id, itemCode, x, z, floorLevel, facingIdx, wy]
+        `INSERT INTO room_furniture (user_id, item_code, x, z, floor_level, facing_idx, wy, pair_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [user.id, itemCode, x, z, floorLevel, facingIdx, wy, pairId]
       );
       return sendJson(res, 200, { ok: true, data: { id: result.insertId } });
     }
@@ -111,6 +112,27 @@ module.exports = function registerRoomFurnitureRoutes(_deps) {
         [user.id, itemCode, x, z]
       );
       return sendJson(res, 200, { ok: true });
+    }
+
+    // GET /api/game/user/room/furniture/teleport?furniture_id=X
+    // Verknüpftes Teleporter-Stück finden (gleiche pair_id, anderes Möbel-Element)
+    if (pathname === '/api/game/user/room/furniture/teleport' && req.method === 'GET') {
+      ensureDbEnabled();
+      const params = new URL(requestUrl, 'http://x').searchParams;
+      const furnitureId = parseInt(params.get('furniture_id') || '0', 10);
+      if (!furnitureId) return sendJson(res, 422, { ok: false, error: 'furniture_id erforderlich' });
+
+      const [rows] = await dbPool.query(
+        `SELECT rf2.id AS target_furniture_id, rf2.user_id AS target_user_id,
+                rf2.x, rf2.z, rf2.floor_level
+         FROM room_furniture rf1
+         JOIN room_furniture rf2 ON rf2.pair_id = rf1.pair_id AND rf2.id != rf1.id
+         WHERE rf1.id = ? AND rf1.pair_id IS NOT NULL
+         LIMIT 1`,
+        [furnitureId]
+      );
+      if (!rows[0]) return sendJson(res, 404, { ok: false, error: 'Kein verknüpfter Teleporter gefunden' });
+      return sendJson(res, 200, { ok: true, data: rows[0] });
     }
 
     // DELETE /api/game/user/room/furniture/:id

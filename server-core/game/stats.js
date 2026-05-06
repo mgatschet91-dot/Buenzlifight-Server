@@ -16,6 +16,7 @@ const {
 
 const ECONOMY_LOG_FILE = path.join(__dirname, '..', 'logs', 'economy.log');
 
+
 async function appendEconomyLog(entry) {
   try {
     await fs.mkdir(path.dirname(ECONOMY_LOG_FILE), { recursive: true });
@@ -1295,58 +1296,12 @@ async function recomputeAuthoritativePopulationAndJobs(municipalityId, roomCode,
   const totalTaxCollected = Math.max(0, Math.round(toFiniteNumber(rawStats.total_tax_collected, 0)));
   const totalSpent = Math.max(0, Math.round(toFiniteNumber(rawStats.total_spent, 0)));
 
-  let idleEarnings = 0;
-  let idleDays = 0;
-  const dbUpdatedAt = Number(rawStats._db_updated_at || 0);
-  if (dbUpdatedAt > 0 && income > 0) {
-    const nowMs = Date.now();
-    const offlineMs = nowMs - dbUpdatedAt;
-    const offlineDays = offlineMs / (1000 * 60 * 60 * 24);
-    if (offlineDays > 5 / (60 * 24)) {
-      const dailyNet = income - expenses;
-      const cappedDays = Math.min(offlineDays, 7);
-      const earnings = Math.floor(dailyNet * cappedDays);
-      if (earnings !== 0) {
-        idleEarnings = earnings;
-        idleDays = Math.round(cappedDays * 100) / 100;
-        const timeText =
-          idleDays >= 1
-            ? `${idleDays} Tag${idleDays >= 1.5 ? 'e' : ''}`
-            : `${Math.round(idleDays * 24)} Stunde${Math.round(idleDays * 24) !== 1 ? 'n' : ''}`;
-        const earningsText =
-          earnings >= 0 ? `+$${earnings.toLocaleString()}` : `-$${Math.abs(earnings).toLocaleString()}`;
-        createNotificationForAllMembers(municipalityId, {
-          type: 'idle_earnings',
-          title: 'Willkommen zurück!',
-          message: `Deine Stadt hat in ${timeText} ${earningsText} verdient`,
-          icon: earnings >= 0 ? 'money' : 'city',
-          amount: earnings,
-        });
-      }
-    }
-  }
+  // === Periodische Einnahmen werden vom Hintergrund-Job in intervals.js verwaltet ===
+  // runIncomeSchedulerTick() läuft alle 5 Minuten für ALLE Gemeinden (online & offline).
+  // Gutschrift erfolgt alle 60 Minuten, basierend auf municipality_stats.last_income_at.
+  // Stats.js schreibt daily_income / daily_expenses → der Job liest diese Werte.
 
-  // === Taegliche Treasury-Gutschrift (server-authoritative) ===
-  // Nur 1x pro Tag ausfuehren, dedupliziert ueber last_finance_day
-  let dailyFinanceApplied = 0;
   const todayStr = new Date().toISOString().slice(0, 10);
-  const lastFinanceDay = String(rawStats.last_finance_day || '');
-  if (lastFinanceDay && lastFinanceDay !== todayStr && netDaily !== 0) {
-    try {
-      const { applyMunicipalityTransaction } = require('./bank.js');
-      await applyMunicipalityTransaction(municipalityId, {
-        amount: netDaily,
-        type: 'daily_income',
-        meta: { date: todayStr, income, expenses },
-        source: 'system',
-      });
-      dailyFinanceApplied = netDaily;
-    } catch (err) {
-      logError('STATS', 'Taegliche Treasury-Gutschrift fehlgeschlagen', {
-        municipalityId, netDaily, error: err?.message,
-      });
-    }
-  }
 
   // treasury wird NICHT hier gesetzt – nur applyMunicipalityTransaction darf treasury ändern
   // (mit FOR UPDATE Lock, verhindert Race Conditions bei gleichzeitigen Milestone/Daily-Income Gutschriften)
@@ -1364,22 +1319,6 @@ async function recomputeAuthoritativePopulationAndJobs(municipalityId, roomCode,
     social_contribution_rate: socialContributionRate,
     welfare_per_unemployed: welfarePerUnemployed,
   });
-
-  if (idleEarnings !== 0) {
-    try {
-      const { applyMunicipalityTransaction } = require('./bank.js');
-      await applyMunicipalityTransaction(municipalityId, {
-        amount: idleEarnings,
-        type: 'idle_earnings',
-        meta: { idleDays, dailyIncome: income, dailyExpenses: expenses },
-        source: 'system',
-      });
-    } catch (err) {
-      logError('IDLE', 'Ledger-Eintrag für Idle-Einnahmen fehlgeschlagen', {
-        municipalityId, idleEarnings, error: err?.message,
-      });
-    }
-  }
 
   // === Krisen-Notification bei kritischer Zufriedenheit ===
   // Throttled: max 1x pro Tag, nur wenn Steuern hoch UND Zufriedenheit kritisch
@@ -1558,11 +1497,6 @@ async function recomputeAuthoritativePopulationAndJobs(municipalityId, roomCode,
     vacancy_factor: Math.round(vacancyFactor * 100),
     last_crisis_notification_day: (happinessOverall < 25 && taxRate > 40) ? todayStr : (rawStats.last_crisis_notification_day || ''),
   };
-
-  if (idleEarnings !== 0) {
-    next._idle_earnings = idleEarnings;
-    next._idle_days = idleDays;
-  }
 
   // Transiente Daten fuer intervals.js (werden nicht in DB gespeichert)
   next._landValueGrid = landValueGrid;

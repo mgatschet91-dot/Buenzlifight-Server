@@ -41,19 +41,71 @@ module.exports = function registerShopFurnitureRoutes(_deps) {
       const item = itemRows[0];
       if (!item) return sendJson(res, 404, { ok: false, error: 'Item nicht gefunden' });
 
-      // Teleporter: 1 kaufen = 2 Stück (müssen paarweise platziert werden)
-      const actualQty = itemCode === 'teleporter' ? qty * 2 : qty;
+      const totalCost = item.price * qty;
 
-      await dbPool.query(
-        `INSERT INTO user_inventory (user_id, item_code, quantity)
-         VALUES (?, ?, ?)
-         ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity), updated_at = NOW()`,
-        [user.id, itemCode, actualQty]
-      );
+      const conn = await dbPool.getConnection();
+      try {
+        await conn.beginTransaction();
+
+        // Kontostand prüfen und abbuchen (nur wenn Preis > 0)
+        if (totalCost > 0) {
+          const [accRows] = await conn.query(
+            `SELECT id, balance FROM user_bank_accounts WHERE user_id = ? AND status = 'active' LIMIT 1`,
+            [user.id]
+          );
+          if (!accRows.length) {
+            await conn.rollback();
+            conn.release();
+            return sendJson(res, 400, { ok: false, error: 'Kein aktives Bankkonto gefunden' });
+          }
+          const acc = accRows[0];
+          const newBalance = Number(acc.balance) - totalCost;
+          if (newBalance < 0) {
+            await conn.rollback();
+            conn.release();
+            return sendJson(res, 402, { ok: false, error: 'Nicht genug Geld auf dem Konto' });
+          }
+          await conn.query(
+            `UPDATE user_bank_accounts SET balance = ?, updated_at = NOW() WHERE id = ?`,
+            [newBalance, acc.id]
+          );
+          await conn.query(
+            `INSERT INTO bank_transactions (account_id, direction, type, amount, balance_after, reference, description, meta_json)
+             VALUES (?, 'debit', 'shop_purchase', ?, ?, ?, ?, NULL)`,
+            [acc.id, totalCost, newBalance, `shop:${itemCode}`, `Shop: ${item.display_name} (${qty}x)`]
+          );
+        }
+
+        let pairIds = [];
+        if (itemCode === 'teleporter') {
+          // Teleporter: jeder Kauf = separates Paar mit 2 Stücken (nie stacken)
+          for (let i = 0; i < qty; i++) {
+            const [pr] = await conn.query(
+              `INSERT INTO teleporter_pairs (user_id, pieces_left) VALUES (?, 2)`,
+              [user.id]
+            );
+            pairIds.push(pr.insertId);
+          }
+        } else {
+          await conn.query(
+            `INSERT INTO user_inventory (user_id, item_code, quantity)
+             VALUES (?, ?, ?)
+             ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity), updated_at = NOW()`,
+            [user.id, itemCode, qty]
+          );
+        }
+
+        await conn.commit();
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
 
       return sendJson(res, 200, {
         ok: true,
-        data: { item_code: itemCode, display_name: item.display_name, quantity_added: actualQty },
+        data: { item_code: itemCode, display_name: item.display_name, quantity_added: itemCode === 'teleporter' ? qty * 2 : qty },
       });
     }
 
@@ -67,6 +119,19 @@ module.exports = function registerShopFurnitureRoutes(_deps) {
       const body = await readJsonBody(req);
       const itemCode = (body.item_code || '').toString().trim();
       if (!itemCode) return sendJson(res, 422, { ok: false, error: 'item_code erforderlich' });
+
+      if (itemCode === 'teleporter') {
+        const pairId = parseInt(body.pair_id, 10);
+        if (!pairId) return sendJson(res, 422, { ok: false, error: 'pair_id erforderlich für Teleporter' });
+        const [result] = await dbPool.query(
+          `UPDATE teleporter_pairs SET pieces_left = GREATEST(0, pieces_left - 1)
+           WHERE id = ? AND user_id = ? AND pieces_left > 0`,
+          [pairId, user.id]
+        );
+        if (result.affectedRows === 0) return sendJson(res, 409, { ok: false, error: 'Nicht genug im Inventar' });
+        const [rows] = await dbPool.query(`SELECT pieces_left FROM teleporter_pairs WHERE id = ?`, [pairId]);
+        return sendJson(res, 200, { ok: true, data: { item_code: itemCode, pair_id: pairId, quantity: rows[0]?.pieces_left ?? 0 } });
+      }
 
       const [result] = await dbPool.query(
         `UPDATE user_inventory
@@ -97,6 +162,18 @@ module.exports = function registerShopFurnitureRoutes(_deps) {
       const itemCode = (body.item_code || '').toString().trim();
       if (!itemCode) return sendJson(res, 422, { ok: false, error: 'item_code erforderlich' });
 
+      if (itemCode === 'teleporter') {
+        const pairId = parseInt(body.pair_id, 10);
+        if (!pairId) return sendJson(res, 422, { ok: false, error: 'pair_id erforderlich für Teleporter' });
+        await dbPool.query(
+          `UPDATE teleporter_pairs SET pieces_left = LEAST(2, pieces_left + 1)
+           WHERE id = ? AND user_id = ?`,
+          [pairId, user.id]
+        );
+        const [rows] = await dbPool.query(`SELECT pieces_left FROM teleporter_pairs WHERE id = ?`, [pairId]);
+        return sendJson(res, 200, { ok: true, data: { item_code: itemCode, pair_id: pairId, quantity: rows[0]?.pieces_left ?? 1 } });
+      }
+
       // Sicherstellen dass das Item existiert (kein Cheat mit ungültigen Codes)
       const [itemRows] = await dbPool.query(
         `SELECT item_code FROM shop_items WHERE item_code = ? AND is_active = 1 LIMIT 1`,
@@ -125,23 +202,55 @@ module.exports = function registerShopFurnitureRoutes(_deps) {
       const user = await getAuthenticatedUser(req);
       if (!user) return sendJson(res, 401, { ok: false, error: 'Nicht angemeldet' });
 
-      const [rows] = await dbPool.query(
+      // Reguläre Items (ohne Teleporter, die in teleporter_pairs verwaltet werden)
+      const [invRows] = await dbPool.query(
         `SELECT
            ui.item_code,
            ui.quantity,
            si.display_name,
            si.category,
            si.icon,
-           si.price
+           si.price,
+           NULL AS pair_id
          FROM user_inventory ui
          JOIN shop_items si ON si.item_code = ui.item_code COLLATE utf8mb4_unicode_ci
          WHERE ui.user_id = ?
+           AND ui.item_code != 'teleporter'
            AND si.is_active = 1
            AND ui.quantity > 0
          ORDER BY si.category ASC, si.sort_order ASC`,
         [user.id]
       );
-      return sendJson(res, 200, { ok: true, data: { items: rows } });
+
+      // Teleporter-Paare: jedes Paar als eigene Zeile
+      const [tpRows] = await dbPool.query(
+        `SELECT
+           tp.id AS pair_id,
+           tp.pieces_left AS quantity,
+           si.display_name,
+           si.category,
+           si.icon,
+           si.price
+         FROM teleporter_pairs tp
+         JOIN shop_items si ON si.item_code = 'teleporter' COLLATE utf8mb4_unicode_ci
+         WHERE tp.user_id = ?
+           AND tp.pieces_left > 0
+           AND si.is_active = 1
+         ORDER BY tp.id ASC`,
+        [user.id]
+      );
+
+      const teleporterItems = tpRows.map(r => ({
+        item_code: 'teleporter',
+        quantity: r.quantity,
+        display_name: r.display_name,
+        category: r.category,
+        icon: r.icon,
+        price: r.price,
+        pair_id: r.pair_id,
+      }));
+
+      return sendJson(res, 200, { ok: true, data: { items: [...invRows, ...teleporterItems] } });
     }
   };
 };

@@ -57,6 +57,8 @@ const CORS_ALLOW_ALL = CORS_ALLOWED_ORIGIN_SET.has('*');
 const CLIENT_TOOL_INFO_PATH = path.resolve(__dirname, '..', '..', 'mapGame', 'src', 'games', 'isocity', 'types', 'game.ts');
 const CLIENT_ITEM_DETAILS_PATH = path.resolve(__dirname, '..', '..', 'mapGame', 'src', 'lib', 'itemDetails.ts');
 const CLIENT_BUILDING_STATS_PATH = path.resolve(__dirname, '..', '..', 'mapGame', 'src', 'games', 'isocity', 'types', 'buildings.ts');
+// Statische JSON-Datei die beim Serverstart geschrieben wird (Gebäudepreise für Client)
+const ITEM_PRICES_OUTPUT_PATH = path.resolve(__dirname, '..', '..', 'mapGame', 'public', '_data', 'item-prices.json');
 const HARD_CODED_BUILDING_STATS = new Map([
   // [tool, { maxPop, maxJobs, pollution, landValue }]
   // Kopiert von Client: mapGame/src/games/isocity/types/buildings.ts
@@ -174,9 +176,7 @@ const SERVICE_UPGRADE_TOOLS = new Set([
   'school',
   'university',
   'power_plant',
-  'solar_panel',
   'water_tower',
-  'woodcutter_house',
 ]);
 
 const COAT_OF_ARMS_UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'coat-of-arms');
@@ -309,6 +309,7 @@ module.exports = {
   CLIENT_TOOL_INFO_PATH,
   CLIENT_ITEM_DETAILS_PATH,
   CLIENT_BUILDING_STATS_PATH,
+  ITEM_PRICES_OUTPUT_PATH,
   HARD_CODED_BUILDING_STATS,
   SERVICE_UPGRADE_TOOLS,
   COAT_OF_ARMS_UPLOAD_DIR,

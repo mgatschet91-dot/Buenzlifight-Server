@@ -216,7 +216,31 @@ module.exports = function registerRoomHandlers(socket, io, context) {
       state.canSendStatsUpdates = false;
     }
 
+    // Ban-Check: Ist der Spieler vom Raum-Eigentümer verbannt?
+    if (ownerUserId && state.currentUserId && ownerUserId !== state.currentUserId) {
+      try {
+        const { dbPool } = require('../../../infra/db');
+        const [banRows] = await dbPool.query(
+          `SELECT id FROM room_bans WHERE owner_user_id = ? AND banned_user_id = ? LIMIT 1`,
+          [ownerUserId, state.currentUserId]
+        );
+        if (banRows.length > 0) {
+          socket.emit('room-banned', { message: 'Du wurdest von diesem Raum verbannt.' });
+          return;
+        }
+      } catch { /* non-critical */ }
+    }
+
     socket.join(state.currentRoomKey);
+
+    // Global- und Kantonal-Chat Rooms beitreten (nur für authentifizierte User)
+    if (state.socketAuthUserId) {
+      socket.join('global:CHAT');
+      if (municipality?.canton_code) {
+        socket.join(`canton:${municipality.canton_code.toUpperCase()}:CHAT`);
+      }
+    }
+
     if (!wsRoomPlayers.has(state.currentRoomKey)) {
       wsRoomPlayers.set(state.currentRoomKey, new Map());
     }
@@ -361,6 +385,7 @@ module.exports = function registerRoomHandlers(socket, io, context) {
     }
     const avatar = {
       playerId: state.currentPlayerId,
+      userId: state.socketAuthUserId || null,
       name: state.playerName,
       x: Number(data.x ?? 0),
       y: Number(data.y ?? 0),
@@ -456,8 +481,24 @@ module.exports = function registerRoomHandlers(socket, io, context) {
     if (!municipalityId) return;
     try {
       const { tileX, tileY, slot, color } = data;
-      const leaveAfter = Math.floor(60 + Math.random() * 240); // 1-5 min
       const { dbPool } = require('../../../infra/db');
+      // Parkdauer nach Preis: teuer = kürzer, kostenlos = länger
+      const [[cfg]] = await dbPool.query(
+        `SELECT is_free, fee_rate FROM parking_config WHERE municipality_id = ? AND tile_x = ? AND tile_y = ?`,
+        [municipalityId, tileX, tileY]
+      );
+      const isFree = cfg?.is_free ?? 0;
+      const feeRate = Number(cfg?.fee_rate ?? 3);
+      let leaveAfter;
+      if (isFree) {
+        leaveAfter = Math.floor(7200 + Math.random() * 7200);  // kostenlos: 2-4 h
+      } else if (feeRate <= 5) {
+        leaveAfter = Math.floor(3600 + Math.random() * 7200);  // günstig: 1-3 h
+      } else if (feeRate <= 12) {
+        leaveAfter = Math.floor(1800 + Math.random() * 5400);  // mittel: 0.5-2 h
+      } else {
+        leaveAfter = Math.floor(900 + Math.random() * 2700);   // teuer: 15 min-1 h
+      }
       await dbPool.query(
         'INSERT IGNORE INTO parked_vehicles (municipality_id, tile_x, tile_y, slot, color, leave_after_seconds) VALUES (?, ?, ?, ?, ?, ?)',
         [municipalityId, tileX, tileY, slot, color, leaveAfter]
@@ -479,7 +520,7 @@ module.exports = function registerRoomHandlers(socket, io, context) {
     const meta = wsRoomMetadata.get(state.currentRoomKey);
     const municipalityId = meta?.municipalityId;
     if (!municipalityId) return;
-    if (!['admin','mayor','deputy'].includes(state.socketMunicipalityRole)) return;
+    if (!['owner','council'].includes(state.socketMunicipalityRole)) return;
     try {
       const { tileX, tileY, isFree, feeRate } = data;
       const rate = Math.max(1, Math.min(20, Number(feeRate) || 3));

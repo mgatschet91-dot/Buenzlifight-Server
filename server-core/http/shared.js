@@ -123,7 +123,9 @@ async function markItemsConstructed(municipalityId, roomCode, positions) {
   let deleted = 0;
   let currentVersion = await getRoomItemVersion(municipalityId, roomCode);
   let statsSnapshot = (await loadRoomStats(municipalityId, roomCode)) || {};
-  let currentMoney = await getMunicipalityMoney(municipalityId);
+  // Nutze game_stats.money (was der Spieler sieht) statt municipality_stats.treasury
+  // (treasury wird durch Income-Events nicht automatisch synced und ist daher oft 0)
+  let currentMoney = toFiniteNumber(statsSnapshot?.money, 0);
   const originalMoney = currentMoney;
   let statsChanged = false;
   const itemDetailCache = new Map();
@@ -202,6 +204,7 @@ async function markItemsConstructed(municipalityId, roomCode, positions) {
         let detail = itemDetailCache.get(toolName);
         if (typeof detail === 'undefined') { detail = await ensureItemDetailExists(toolName, null); itemDetailCache.set(toolName, detail || null); }
         const baseCost = detail ? Math.max(0, Math.round(toFiniteNumber(detail.build_cost, 0))) : 0;
+        // build_cost × 2^previousLevel: L1→L2=×2, L2→L3=×4, L3→L4=×8, L4→L5=×16
         const upgradeCost = Math.max(0, Math.round(baseCost * Math.pow(2, previousLevel)));
         if (!(upgradeCost > 0 && currentMoney < upgradeCost)) {
           if (upgradeCost > 0) {
@@ -235,6 +238,7 @@ async function markItemsConstructed(municipalityId, roomCode, positions) {
           if (typeof detail === 'undefined') { detail = await ensureItemDetailExists(toolName, null); itemDetailCache.set(toolName, detail || null); }
           const baseCost = detail ? Math.max(0, Math.round(toFiniteNumber(detail.build_cost, 0))) : 0;
           let totalUpgradeCost = 0;
+          // build_cost × 2^lvl: L1→L2=×2, L2→L3=×4, L3→L4=×8, L4→L5=×16
           for (let lvl = previousLevel; lvl < safeLevel; lvl++) totalUpgradeCost += Math.max(0, Math.round(baseCost * Math.pow(2, lvl)));
           if (totalUpgradeCost > 0) {
             if (currentMoney < totalUpgradeCost) safeLevel = previousLevel;
@@ -265,7 +269,27 @@ async function markItemsConstructed(municipalityId, roomCode, positions) {
     await saveRoomStats(municipalityId, roomCode, statsSnapshot);
     const totalCost = originalMoney - currentMoney;
     if (totalCost > 0) {
-      await applyMunicipalityTransaction(municipalityId, { amount: -totalCost, type: 'upgrade_cost', meta: { roomCode, positionsProcessed: positions.length }, source: 'system' });
+      // Direktes Ledger-INSERT statt applyMunicipalityTransaction:
+      // treasury (municipality_stats) ist nicht mit game_stats.money synchronisiert,
+      // daher würde applyMunicipalityTransaction bei leerem Treasury fälschlicherweise
+      // loan_take-Einträge erzeugen. Wir schreiben nur den Ledger-Eintrag.
+      try {
+        await dbPool.query(
+          `INSERT INTO municipality_ledger
+             (municipality_id, type, amount, balance_after, debt_after, meta_json, actor_user_id, source)
+           VALUES (?, 'upgrade_cost', ?, ?, 0, ?, NULL, 'system')`,
+          [
+            municipalityId,
+            -totalCost,
+            toFiniteNumber(statsSnapshot.money, 0),
+            JSON.stringify({ roomCode, positionsProcessed: positions.length }),
+          ]
+        );
+      } catch (ledgerErr) {
+        // Ledger-Fehler blockiert nicht den Upgrade-Prozess
+        const { logError } = require('../infra/logger');
+        logError('UPGRADE', `Ledger-Eintrag fehlgeschlagen: ${ledgerErr.message}`);
+      }
     }
   }
   return { updated, deleted };

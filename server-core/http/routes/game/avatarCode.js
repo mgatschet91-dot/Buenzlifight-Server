@@ -7,13 +7,12 @@ const { getAuthenticatedUser } = require('../../../auth/middleware');
 // Default avatar code: skin|hair|hairStyle|shirt|shirtStyle|pants|pantsStyle|shoe|shoeStyle|hat
 const DEFAULT_AVATAR_CODE = 'ffd7aa|444444|short|5596aa|tshirt|334455|jeans|333333|basic|none';
 
-// Validates that the code is a pipe-separated string of exactly 10 segments
+// Validates that the code is a pipe-separated string of 10-20 segments
 function isValidAvatarCode(code) {
   if (typeof code !== 'string') return false;
   const parts = code.split('|');
-  if (parts.length !== 10) return false;
-  // First two must be hex colors, rest must be non-empty strings
-  return parts.every(p => p.length > 0 && p.length <= 30);
+  if (parts.length < 10 || parts.length > 20) return false;
+  return parts.every(p => p.length > 0 && p.length <= 50);
 }
 
 module.exports = function registerAvatarCodeRoutes(_deps) {

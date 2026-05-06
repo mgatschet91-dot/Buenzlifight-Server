@@ -717,7 +717,7 @@ module.exports = function registerAdminRoutes(deps) {
       if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
       const userId = Number(adminUserBadgesMatch[1]);
       const [rows] = await dbPool.query(
-        `SELECT ub.badge_code, b.name, b.image_url, b.rarity, b.category, ub.acquired_at
+        `SELECT ub.badge_code AS code, b.name, b.description, COALESCE(b.image_url, '') AS image_url, b.rarity, b.category, ub.acquired_at
          FROM user_badges ub
          LEFT JOIN badges b ON b.code = ub.badge_code
          WHERE ub.user_id = ?
@@ -1006,6 +1006,86 @@ module.exports = function registerAdminRoutes(deps) {
       await dbPool.query(`DELETE FROM municipality_memberships WHERE municipality_id = ? AND user_id = ?`, [municipality_id, user_id]);
       await dbPool.query(`UPDATE users SET municipality_id = NULL WHERE id = ? AND municipality_id = ?`, [user_id, municipality_id]);
       return sendJson(res, 200, { ok: true, data: { message: 'Mitglied entfernt' } });
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // DATENBANK-BACKUP (SQL + ZIP)
+    // ══════════════════════════════════════════════════════════════
+    if (req.method === 'GET' && pathname === '/api/admin/backup') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (authUser.global_role !== 'administrator') return sendJson(res, 403, { ok: false, error: 'Nur Admins' });
+
+      const archiver = require('archiver');
+      const { Readable } = require('stream');
+
+      const now = new Date();
+      const ts = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const sqlFilename = `backup_${ts}.sql`;
+      const zipFilename = `backup_${ts}.zip`;
+
+      // SQL-Dump komplett im Speicher aufbauen
+      const lines = [];
+      lines.push(`-- Buenzlifight DB Backup`);
+      lines.push(`-- Erstellt: ${now.toISOString()}`);
+      lines.push(`-- Server: ${process.env.DB_HOST || 'localhost'}`);
+      lines.push('');
+      lines.push('SET FOREIGN_KEY_CHECKS=0;');
+      lines.push('SET SQL_MODE="NO_AUTO_VALUE_ON_ZERO";');
+      lines.push('SET NAMES utf8mb4;');
+      lines.push('');
+
+      const [tables] = await dbPool.query('SHOW TABLES');
+      const tableNames = tables.map(r => Object.values(r)[0]);
+
+      for (const table of tableNames) {
+        lines.push(`-- --------------------------------------------------------`);
+        lines.push(`-- Tabelle: \`${table}\``);
+        lines.push(`-- --------------------------------------------------------`);
+        lines.push('');
+
+        // CREATE TABLE
+        const [[createRow]] = await dbPool.query(`SHOW CREATE TABLE \`${table}\``);
+        const createSql = createRow['Create Table'] || createRow[Object.keys(createRow)[1]];
+        lines.push(`DROP TABLE IF EXISTS \`${table}\`;`);
+        lines.push(createSql + ';');
+        lines.push('');
+
+        // Daten als INSERT
+        const [rows] = await dbPool.query(`SELECT * FROM \`${table}\``);
+        if (rows.length > 0) {
+          const cols = Object.keys(rows[0]).map(c => `\`${c}\``).join(', ');
+          const escapeVal = v => {
+            if (v === null || v === undefined) return 'NULL';
+            if (typeof v === 'number') return String(v);
+            if (v instanceof Date) return `'${v.toISOString().slice(0, 19).replace('T', ' ')}'`;
+            if (Buffer.isBuffer(v)) return `0x${v.toString('hex')}`;
+            return `'${String(v).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r')}'`;
+          };
+          const chunks = [];
+          for (let i = 0; i < rows.length; i += 500) chunks.push(rows.slice(i, i + 500));
+          for (const chunk of chunks) {
+            const vals = chunk.map(row => `(${Object.values(row).map(escapeVal).join(', ')})`).join(',\n  ');
+            lines.push(`INSERT INTO \`${table}\` (${cols}) VALUES`);
+            lines.push(`  ${vals};`);
+          }
+          lines.push('');
+        }
+      }
+
+      lines.push('SET FOREIGN_KEY_CHECKS=1;');
+      const sqlContent = lines.join('\n');
+
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="${zipFilename}"`);
+
+      const archive = archiver('zip', { zlib: { level: 6 } });
+      archive.on('error', err => { console.error('[backup] archiver error:', err); if (!res.headersSent) res.end(); });
+      archive.pipe(res);
+      archive.append(Readable.from([sqlContent]), { name: sqlFilename });
+      await archive.finalize();
+      return;
     }
 
     if (req.method === 'GET' && pathname === '/api/admin/actions/server-info') {

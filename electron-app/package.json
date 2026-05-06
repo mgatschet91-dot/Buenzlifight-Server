@@ -1,0 +1,62 @@
+{
+  "name": "buenzlifight-electron",
+  "version": "1.0.0",
+  "description": "BuenzliFight Windows Client",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron main.src.js --dev",
+    "protect": "electron scripts/protect.js",
+    "dist": "electron-builder --win",
+    "dist:steam": "electron-builder --win --config.win.target=dir"
+  },
+  "build": {
+    "appId": "ch.buenzlifight.app",
+    "productName": "BuenzliFight",
+    "copyright": "BuenzliFight",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "build/icon.ico",
+      "shortcutName": "BuenzliFight"
+    },
+    "files": [
+      "main.js",
+      "main.jsc",
+      "preload.js",
+      "preload.jsc",
+      "steam_appid.txt",
+      "!main.src.js",
+      "!preload.src.js"
+    ],
+    "extraResources": [
+      {
+        "from": "../mapGame/.next/standalone",
+        "to": "renderer/standalone"
+      }
+    ],
+    "asarUnpack": [
+      "**/node_modules/steamworks.js/**"
+    ]
+  },
+  "dependencies": {
+    "bytenode": "^1.5.6",
+    "steamworks.js": "^0.3.1"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "sharp": "^0.34.5"
+  }
+}

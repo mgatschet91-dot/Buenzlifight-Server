@@ -1,8 +1,12 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const { sendJson } = require('../infra/http');
 const { applyCorsHeaders } = require('../infra/cors');
 const { logError } = require('../infra/logger');
+
+const BADGES_DIR = path.join(__dirname, '../public/badges');
 
 const { processConstructionSyncAndBroadcast, wsPublishAuthoritativeStats } = require('./shared');
 
@@ -52,6 +56,37 @@ function createRequestHandler(deps) {
       }
 
       applyCorsHeaders(req, res);
+
+      // ── Static Badge-Bilder: /badges/CODE.gif|png ───────────────────
+      if (req.method === 'GET' && pathname.startsWith('/badges/')) {
+        const filename = path.basename(pathname);
+        const mimeMatch = filename.match(/^([A-Za-z0-9_-]+)\.(gif|png)$/);
+        if (mimeMatch) {
+          const base = mimeMatch[1];
+          const ext = mimeMatch[2];
+          const altExt = ext === 'gif' ? 'png' : 'gif';
+          const primary = path.join(BADGES_DIR, `${base}.${ext}`);
+          const fallback = path.join(BADGES_DIR, `${base}.${altExt}`);
+          const [filePath, mime] = fs.existsSync(primary)
+            ? [primary, ext === 'png' ? 'image/png' : 'image/gif']
+            : fs.existsSync(fallback)
+              ? [fallback, altExt === 'png' ? 'image/png' : 'image/gif']
+              : [null, null];
+          if (filePath) {
+            const data = fs.readFileSync(filePath);
+            res.writeHead(200, {
+              'Content-Type': mime,
+              'Cache-Control': 'public, max-age=604800',
+              'Content-Length': data.length,
+            });
+            res.end(data);
+            return;
+          }
+        }
+        res.writeHead(404);
+        res.end();
+        return;
+      }
 
       // ── robots.txt: Block all crawlers from indexing the API domain ──
       if (pathname === '/robots.txt') {

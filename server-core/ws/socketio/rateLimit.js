@@ -16,6 +16,8 @@ const RATE_LIMITS = {
   'room-chat': { max: 10, windowMs: 10_000 },
   'messenger-send': { max: 10, windowMs: 10_000 },
   'messenger-friend-request': { max: 5, windowMs: 60_000 },
+  'messenger-search': { max: 10, windowMs: 30_000 },
+  'messenger-block': { max: 20, windowMs: 60_000 },
   // movement (higher limits)
   'cursor': { max: 30, windowMs: 5_000 },
   'avatar-move-request': { max: 200, windowMs: 5_000 },  // Roller/WASD: ~12.5/s → braucht 200/5s

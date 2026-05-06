@@ -10,8 +10,12 @@
     "migrate:status": "node migrate.js status"
   },
   "dependencies": {
+    "archiver": "^7.0.1",
     "mysql2": "^3.15.2",
     "socket.io": "^4.8.3",
     "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "sharp": "^0.34.5"
   }
 }

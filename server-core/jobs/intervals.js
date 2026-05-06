@@ -327,6 +327,33 @@ function registerIntervals(deps) {
     }
   }, 60000));
 
+  // 5b) Partnership tier upgrade check (every 6h)
+  intervals.push(setInterval(async () => {
+    try {
+      const { processTierUpgrades } = require('../game/partnerships');
+      const result = await processTierUpgrades();
+      if (result.upgraded > 0) {
+        logInfo('PARTNERSHIP', `Tier-Upgrades verarbeitet: ${result.upgraded} Partnerschaften aufgestuft`);
+      }
+    } catch (err) {
+      logError('INTERVAL', 'Partnership tier tick error', { error: err?.message });
+    }
+  }, 6 * 60 * 60 * 1000));
+
+  // 5c) Partnership trade income payout (every 60s, pays only if 24h since last payout)
+  //     Idle-ready: zahlt auch wenn kein Spieler online ist (wie Transport Revenue)
+  intervals.push(setInterval(async () => {
+    try {
+      const { processTradeIncomePayouts } = require('../game/partnerships');
+      const result = await processTradeIncomePayouts();
+      if (result.paid > 0) {
+        logInfo('PARTNERSHIP', `Handelseinnahmen ausgezahlt: ${result.paid} Partnerschaften, ${result.totalAmount} CHF total`);
+      }
+    } catch (err) {
+      logError('INTERVAL', 'Partnership trade payout error', { error: err?.message });
+    }
+  }, 60000));
+
   // 6) Company loan weekly repayment tick (every 60s, pays only if 7 days passed)
   intervals.push(setInterval(async () => {
     try {
@@ -696,6 +723,98 @@ function registerIntervals(deps) {
       logError('INTERVAL', 'Mayor succession tick error', { error: err?.message });
     }
   }, 6 * 60 * 60 * 1000));
+
+  // N) Einnahmen-Scheduler: alle 5 Minuten für ALLE Gemeinden (online & offline gleich)
+  //    Gutschrift erfolgt wenn seit last_income_at >= 60 Minuten vergangen sind.
+  //    Basiert auf municipality_stats.daily_income / daily_expenses (vom Stats-Loop gepflegt).
+  intervals.push(setInterval(async () => {
+    try {
+      const { dbPool } = require('../infra/db.js');
+      const { applyMunicipalityTransaction } = require('../game/bank.js');
+      const { createNotificationForAllMembers } = require('../game/notifications.js');
+      if (!dbPool) return;
+
+      const INCOME_INTERVAL_MS = 60 * 60 * 1000; // 1 Stunde
+      const MAX_CATCHUP_DAYS = 7;
+
+      const [rows] = await dbPool.query(
+        `SELECT municipality_id, daily_income, daily_expenses, last_income_at
+         FROM municipality_stats
+         WHERE last_income_at IS NULL
+            OR last_income_at <= DATE_SUB(NOW(), INTERVAL 60 MINUTE)`
+      );
+
+      for (const row of rows) {
+        try {
+          const dailyNet = (Number(row.daily_income) || 0) - (Number(row.daily_expenses) || 0);
+
+          const lastAt = row.last_income_at ? new Date(row.last_income_at).getTime() : null;
+          const nowMs = Date.now();
+          const elapsedMs = lastAt ? (nowMs - lastAt) : INCOME_INTERVAL_MS;
+          const elapsedDays = Math.min(elapsedMs / (1000 * 60 * 60 * 24), MAX_CATCHUP_DAYS);
+          const elapsedHours = Math.round(elapsedMs / (1000 * 60 * 60) * 10) / 10;
+          const earnings = Math.floor(dailyNet * elapsedDays);
+
+          logInfo('INCOME', `Gemeinde ${row.municipality_id}: Einnahmen-Tick`, {
+            lastIncomeAt: row.last_income_at || 'nie',
+            elapsedHours,
+            dailyNet,
+            earnings,
+          });
+
+          // last_income_at immer aktualisieren (auch wenn earnings=0) damit der Timer korrekt läuft
+          await dbPool.query(
+            `UPDATE municipality_stats SET last_income_at = NOW() WHERE municipality_id = ?`,
+            [row.municipality_id]
+          );
+
+          if (earnings === 0) {
+            logInfo('INCOME', `Gemeinde ${row.municipality_id}: earnings=0 (kein Ledger-Eintrag)`, { dailyNet });
+            continue;
+          }
+
+          await applyMunicipalityTransaction(row.municipality_id, {
+            amount: earnings,
+            type: 'income',
+            meta: {
+              days: Math.round(elapsedDays * 100) / 100,
+              hours: elapsedHours,
+              dailyIncome: row.daily_income,
+              dailyExpenses: row.daily_expenses,
+              dailyNet,
+            },
+            source: 'system',
+          });
+
+          logInfo('INCOME', `Gemeinde ${row.municipality_id}: +${earnings} CHF gutgeschrieben`, {
+            hours: elapsedHours,
+            dailyNet,
+          });
+
+          // Notification nur bei echter Abwesenheit (>30 Min) – gespeichert in DB, erscheint beim nächsten Login
+          if (elapsedDays > 30 / (60 * 24)) {
+            const timeText = elapsedDays >= 1
+              ? `${Math.round(elapsedDays)} Tag${Math.round(elapsedDays) !== 1 ? 'e' : ''}`
+              : `${Math.round(elapsedDays * 24)} Stunde${Math.round(elapsedDays * 24) !== 1 ? 'n' : ''}`;
+            const earningsText = earnings >= 0
+              ? `+${earnings.toLocaleString()} CHF`
+              : `-${Math.abs(earnings).toLocaleString()} CHF`;
+            await createNotificationForAllMembers(row.municipality_id, {
+              type: 'idle_earnings',
+              title: earnings >= 0 ? 'Einnahmen gutgeschrieben' : 'Defizit abgebucht',
+              message: `Deine Stadt hat in ${timeText} ${earningsText} verdient`,
+              icon: earnings >= 0 ? 'money' : 'warning',
+              amount: earnings,
+            });
+          }
+        } catch (innerErr) {
+          logError('INCOME', `Einnahmen-Tick fehlgeschlagen für municipality ${row.municipality_id}`, { error: innerErr?.message });
+        }
+      }
+    } catch (err) {
+      logError('INCOME', 'Einnahmen-Scheduler Fehler', { error: err?.message });
+    }
+  }, 5 * 60 * 1000)); // alle 5 Minuten prüfen, aber nur gutschreiben wenn 60 Min rum
 
   logInfo('JOBS', `${intervals.length} Intervalle registriert`);
   return intervals;

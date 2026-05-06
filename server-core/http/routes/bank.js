@@ -37,7 +37,8 @@ module.exports = function registerBankRoutes(/* deps */) {
         const limit = Math.min(50, Number(url.searchParams.get('limit')) || 15);
         const offset = Number(url.searchParams.get('offset')) || 0;
         const filter = url.searchParams.get('filter') || 'all';
-        const result = await getLedger(authUser.municipality_id, { limit, offset, typeFilter: filter });
+        const hours = Number(url.searchParams.get('hours')) || 0;
+        const result = await getLedger(authUser.municipality_id, { limit, offset, typeFilter: filter, hours });
         return sendJson(res, 200, { ok: true, data: result });
       } catch (err) {
         logError('BANK', 'getLedger failed', { municipalityId: authUser.municipality_id, error: err?.message });

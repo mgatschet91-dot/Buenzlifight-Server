@@ -1,0 +1,16 @@
+{
+  "name": "meinort-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord Bot für MeinOrt Spielbenachrichtigungen",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "mysql2": "^3.11.5",
+    "dotenv": "^16.4.7",
+    "socket.io-client": "^4.8.3"
+  }
+}

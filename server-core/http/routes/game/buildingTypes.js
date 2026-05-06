@@ -15,6 +15,22 @@ const {
 module.exports = function registerBuildingTypesRoutes(/* deps */) {
   return async function handleBuildingTypes(req, res, pathname /*, requestUrl */) {
 
+    // ── Item-Preisliste (einmaliger Startup-Fetch vom Client) ────
+    if (req.method === 'GET' && pathname === '/api/game/item-prices') {
+      const details = await fetchItemDetails(null);
+      const prices = {};
+      for (const d of details) {
+        if (!d.tool) continue;
+        prices[String(d.tool)] = {
+          build_cost: Math.max(0, Math.round(Number(d.build_cost) || 0)),
+          upgrade_time_secs: d.upgrade_build_time_seconds != null
+            ? Math.round(Number(d.upgrade_build_time_seconds))
+            : null,
+        };
+      }
+      return sendJson(res, 200, { success: true, data: prices });
+    }
+
     // ── Building types ─────────────────────────────────────────
     if (req.method === 'GET' && pathname === '/api/game/building-types') {
       const details = await fetchItemDetails(null);

@@ -814,6 +814,8 @@ async function runServerZoneGrowthTick(municipalityId, roomCode, sharedRows, con
     // Alle Zone-Tiles sammeln
     const emptyZoneTiles = [];
     const gapClearQueue = []; // Gebaeude auf Gap-Tiles die zurueckgesetzt werden muessen
+    const autoClearGapTiles = []; // Leere Gap-Tiles die freigegeben werden wenn Nachbarn Max-Level
+    const level5ZoneClearQueue = []; // Zone-Rows von Level-5-Gebaeuden loeschen (Rahmen entfernen)
     for (const row of rows) {
       if (row.action_type !== 'zone') continue;
       const zoneType = String(row.zone_type || '').trim().toLowerCase();
@@ -829,10 +831,19 @@ async function runServerZoneGrowthTick(municipalityId, roomCode, sharedRows, con
       if (!bt || bt === 'grass' || bt === '') {
         // Leeres Tile — nur spawnen wenn KEIN Gap-Tile
         if (!isGapTile) emptyZoneTiles.push({ row, zoneType, meta });
+        // Alle leeren Tiles (gap + non-gap) pruefen ob Nachbar Max-Level → dann loeschen
+        autoClearGapTiles.push({ row, gx, gy });
       } else if (isGapTile) {
         // Gebaeude auf Gap-Tile: zuruecksetzen wenn Level <= 1 (noch nicht evolved)
         const lvl = Number(metaValue(meta, 'level') || 0);
         if (lvl <= 1) gapClearQueue.push({ row, meta });
+      } else {
+        // Gebaeude auf normalem Zone-Tile: Zone-Rahmen entfernen wenn Level 5 erreicht (NUR einmal)
+        const lvl = Number(metaValue(meta, 'level') || 0);
+        const progress = Number(metaValue(meta, 'constructionProgress', 'construction_progress') || 0);
+        const isConstructed = Boolean(metaValue(meta, 'constructed')) || progress >= 100;
+        const alreadyCleared = Boolean(meta.zoneCleared);
+        if (lvl >= 5 && isConstructed && !alreadyCleared) level5ZoneClearQueue.push({ row, gx, gy, bt, lvl, meta });
       }
     }
 
@@ -855,6 +866,65 @@ async function runServerZoneGrowthTick(municipalityId, roomCode, sharedRows, con
         [JSON.stringify(clearMeta), currentVersion, timestamp, now, row.id]
       );
       changedTiles.push({ x: Number(row.x), y: Number(row.y), buildingType: 'grass', level: 0, abandoned: false, constructionProgress: 0, constructed: false });
+    }
+
+    // Footprint-Map: alle Positionen die von Level-5-Gebaeuden belegt sind (inkl. multi-tile)
+    const MAX_LEVEL = 5;
+    const maxLevelPositions = new Set();
+    for (const row of rows) {
+      if (row.action_type !== 'zone' && row.action_type !== 'place') continue;
+      const m = toJsonValue(row.metadata) || {};
+      const lvl = Number(metaValue(m, 'level') || 0);
+      if (lvl < MAX_LEVEL) continue;
+      const bt = String(metaValue(m, 'buildingType', 'building_type') || row.tool || '').toLowerCase();
+      if (!bt || bt === 'grass') continue;
+      const ox = Number(row.x), oy = Number(row.y);
+      const size = getServerBuildingSize(bt);
+      for (let fx = 0; fx < size.width; fx++) {
+        for (let fy = 0; fy < size.height; fy++) {
+          maxLevelPositions.add(`${ox + fx},${oy + fy}`);
+        }
+      }
+    }
+
+    // Leere Zone-Tiles freigeben wenn mindestens ein Nachbar im Footprint eines Max-Level-Gebaeudes liegt
+    const neighborOffsets = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+    let cleared = 0;
+    const clearedRowIds = new Set();
+    for (const { row, gx, gy } of autoClearGapTiles) {
+      if (cleared >= 8) break;
+      let hasMaxNeighbor = false;
+      for (const [dx, dy] of neighborOffsets) {
+        if (maxLevelPositions.has(`${gx + dx},${gy + dy}`)) {
+          hasMaxNeighbor = true;
+          break;
+        }
+      }
+      if (!hasMaxNeighbor) continue;
+      currentVersion += 1;
+      await dbPool.query(
+        `DELETE FROM game_items WHERE id = ?`,
+        [row.id]
+      );
+      clearedRowIds.add(row.id);
+      cleared++;
+      changedTiles.push({ x: gx, y: gy, buildingType: 'grass', level: 0, zoneCleared: true });
+    }
+
+    // Zone-Rahmen bei Level-5-Gebaeuden entfernen (max 5 pro Tick)
+    // WICHTIG: Row NICHT loeschen — das wuerde das Gebaeude aus der DB entfernen!
+    // Stattdessen zoneCleared:true ins Metadata schreiben damit der Rahmen visuell verschwindet.
+    let zoneClearCount = 0;
+    for (const { row, gx, gy, bt, lvl, meta } of level5ZoneClearQueue) {
+      if (zoneClearCount >= 5) break;
+      currentVersion += 1;
+      const updatedMeta = { ...meta, zoneCleared: true };
+      await dbPool.query(
+        `UPDATE game_items SET metadata = ?, version = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [JSON.stringify(updatedMeta), currentVersion, row.id]
+      );
+      zoneClearCount++;
+      changedTiles.push({ x: gx, y: gy, buildingType: bt, level: lvl, zoneCleared: true });
     }
 
     if (emptyZoneTiles.length === 0 && changedTiles.length === 0) return { changes: changedTiles };
@@ -893,6 +963,7 @@ async function runServerZoneGrowthTick(municipalityId, roomCode, sharedRows, con
 
     for (const { row, zoneType, meta } of shuffled) {
       if (spawned >= MAX_SPAWNS_PER_TICK) break;
+      if (clearedRowIds.has(row.id)) continue; // bereits in diesem Tick geloescht
 
       const x = Number(row.x);
       const y = Number(row.y);
@@ -1371,7 +1442,6 @@ async function runServerCrimeTick(municipalityId, roomCode, sharedRows, context)
           roomState.lastSpawnTick = roomState.tickCount;
           spawned++;
           crimeEvents.push({ type: 'spawn', id: criminalId, x: cand.x, y: cand.y, isDealer });
-          logInfo('CRIME', `${isDealer ? 'Dealer' : 'Gangster'} #${criminalId} gespawnt (${cand.x},${cand.y}) Room ${municipalityId}:${safeRoomCode}`);
         }
       }
     }
@@ -1452,10 +1522,8 @@ async function runServerCrimeTick(municipalityId, roomCode, sharedRows, context)
           toRemove.push(id);
           if (Math.random() < catchChance) {
             crimeEvents.push({ type: 'caught', id, x: criminal.x, y: criminal.y, stolenTotal: criminal.stolenTotal });
-            logInfo('CRIME', `${criminal.isDealer ? 'Dealer' : 'Gangster'} #${id} gefasst! ${criminal.stolenTotal} CHF Schaden`);
           } else {
             crimeEvents.push({ type: 'escaped', id, x: criminal.x, y: criminal.y });
-            logInfo('CRIME', `${criminal.isDealer ? 'Dealer' : 'Gangster'} #${id} entkommen!`);
           }
         }
       }
@@ -1530,10 +1598,6 @@ async function runServerCrimeTick(municipalityId, roomCode, sharedRows, context)
       });
     }
 
-    // Nur loggen wenn was passiert (nicht jeden leeren Tick)
-    if (crimeEvents.length > 0) {
-      logInfo('CRIME', `Room ${municipalityId}:${safeRoomCode} — ${criminals.size} aktiv, ${stolenTotal} CHF Nacht-Schaden, ${crimeEvents.length} Events (${isNight ? 'Nacht' : 'Tag'})`);
-    }
 
     return { criminals: criminalsList, crimeEvents, stolenTotal, crimeGrid, gridSize, homeless, isNight };
   } finally {

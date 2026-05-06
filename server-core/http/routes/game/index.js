@@ -23,6 +23,7 @@ const registerRoomFurnitureRoutes = require('./roomFurniture');
 const registerAvatarCodeRoutes = require('./avatarCode');
 const registerRoomLayoutRoutes = require('./roomLayout');
 const registerRoomNpcRoutes = require('./roomNpcs');
+const registerRoomModerationRoutes = require('./roomModeration');
 
 module.exports = function registerGameRoutes(deps) {
   const subHandlers = [
@@ -42,6 +43,7 @@ module.exports = function registerGameRoutes(deps) {
     registerAvatarCodeRoutes(deps),
     registerRoomLayoutRoutes(deps),
     registerRoomNpcRoutes(deps),
+    registerRoomModerationRoutes(deps),
   ];
 
   const handleInspections = registerInspectionsRoutes(deps);

@@ -198,7 +198,7 @@ module.exports = function registerProfileRoutes(deps) {
       if (users.length === 0) return sendJson(res, 404, { ok: false, error: 'Spieler nicht gefunden' });
 
       const [badges] = await dbPool.query(
-        `SELECT ub.badge_code, b.name, b.description, COALESCE(b.image_url, '') AS image_url, b.rarity, b.category
+        `SELECT ub.badge_code AS code, b.name, b.description, COALESCE(b.image_url, '') AS image_url, b.rarity, b.category
          FROM user_badges ub
          JOIN badges b ON b.code = ub.badge_code
          WHERE ub.user_id = ?

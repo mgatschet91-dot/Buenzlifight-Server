@@ -337,7 +337,7 @@ async function getBankStatus(municipalityId) {
   await dbPool.query(`INSERT IGNORE INTO municipality_stats (municipality_id) VALUES (?)`, [municipalityId]);
   const [rows] = await dbPool.query(
     `SELECT treasury, debt, credit_limit, interest_rate, last_interest_at,
-            daily_income, daily_expenses, population
+            daily_income, daily_expenses, population, last_income_at
      FROM municipality_stats WHERE municipality_id = ? LIMIT 1`,
     [municipalityId]
   );
@@ -358,6 +358,7 @@ async function getBankStatus(municipalityId) {
     dailyExpenses: Number(r.daily_expenses),
     population,
     nextInterestEstimate: debt > 0 ? Math.max(1, Math.round(debt * rate)) : 0,
+    lastIncomeAt: r.last_income_at || null,
   };
 }
 
@@ -365,12 +366,18 @@ async function getBankStatus(municipalityId) {
 
 async function getLedger(municipalityId, opts = {}) {
   ensureDbEnabled();
-  const limit = Math.max(1, Math.min(50, Number(opts.limit) || 15));
+  const limit = Math.max(1, Math.min(200, Number(opts.limit) || 15));
   const offset = Math.max(0, Number(opts.offset) || 0);
   const typeFilter = opts.typeFilter || null;
 
+  const hours = Number(opts.hours) || 0;
+
   let where = 'municipality_id = ?';
   const params = [municipalityId];
+
+  if (hours > 0) {
+    where += ` AND ts >= DATE_SUB(NOW(), INTERVAL ${Math.round(hours)} HOUR)`;
+  }
 
   if (typeFilter === 'income') {
     where += ' AND amount > 0';

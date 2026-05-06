@@ -892,12 +892,29 @@ async function syncRoomItems(municipalityId, roomCode, clientId, userId, items) 
   const now = new Date();
   const timestamp = Date.now();
 
+  // Kontostand VOR der Schleife laden – für Affordability-Prüfung neuer Gebäude.
+  // Wir lesen direkt aus municipality_stats.treasury (single source of truth),
+  // damit Kosten nicht alle 3s durch den Stats-Loop zurückgesetzt werden.
+  let runningBalance = 0;
+  let totalDeducted = 0;
+  const ledgerEntries = [];
+  const hasNewPlaceItems = items.some(
+    (it) => !existingMap.has(`${Number(it.x)},${Number(it.y)},${it.action_type}`) &&
+             it.action_type === 'place' && it.tool
+  );
+  const hasBalanceCheck = hasNewPlaceItems;
+  if (hasBalanceCheck) {
+    runningBalance = await getMunicipalityMoney(municipalityId);
+  }
+
   for (const item of items) {
     const key = `${Number(item.x)},${Number(item.y)},${item.action_type}`;
-    incomingKeys.add(key);
     const existing = existingMap.get(key);
     const newMeta = item.metadata ?? null;
+
     if (existing) {
+      // Bestehendes Item → update wenn geändert
+      incomingKeys.add(key);
       const existingMeta = toJsonValue(existing.metadata);
       const changed =
         existing.tool !== (item.tool || null) ||
@@ -926,6 +943,36 @@ async function syncRoomItems(municipalityId, roomCode, clientId, userId, items) 
         unchanged += 1;
       }
     } else {
+      // Neues Item → erst Kosten prüfen, dann ggf. einfügen
+      if (item.action_type === 'place' && item.tool && hasBalanceCheck) {
+        const tool = String(item.tool).trim().toLowerCase();
+        try {
+          const [detailRows] = await dbPool.query(
+            `SELECT build_cost FROM game_item_details WHERE tool = ? LIMIT 1`,
+            [tool]
+          );
+          const cost = detailRows[0]
+            ? Math.max(0, Math.round(toFiniteNumber(detailRows[0].build_cost, 0)))
+            : 0;
+
+          if (cost > 0 && runningBalance < cost) {
+            // Kein Geld → Insert überspringen; Client erhält beim nächsten Broadcast korrekten Stand
+            continue;
+          }
+
+          if (cost > 0) {
+            runningBalance -= cost;
+            totalDeducted += cost;
+            ledgerEntries.push({ tool, x: Number(item.x), y: Number(item.y), cost, balanceAfter: runningBalance });
+          }
+        } catch (err) {
+          logError('SYNC', `Kostenabruf fehlgeschlagen für "${item.tool}": ${err.message}`);
+          // Im Fehlerfall: Item trotzdem einfügen (fail-open für Kostencheck)
+        }
+      }
+
+      // Einfügen (nur wenn wir nicht per continue abgebrochen haben)
+      incomingKeys.add(key);
       version += 1;
       await dbPool.query(
         `INSERT INTO game_items
@@ -958,6 +1005,51 @@ async function syncRoomItems(municipalityId, roomCode, clientId, userId, items) 
       deleted += 1;
     }
   }
+
+  // ─── Baukosten direkt auf Treasury buchen ─────────────────────────────
+  // treasury ist die einzige Geldquelle. game_stats.money wird alle 3s
+  // vom Stats-Loop mit getMunicipalityMoney() überschrieben → deshalb
+  // MUSS der Abzug auf treasury gehen, sonst werden Kosten alle 3s zurückgesetzt.
+  if (totalDeducted > 0) {
+    try {
+      // Atomisches Treasury-Update: nur wenn noch genug Geld vorhanden
+      const [result] = await dbPool.query(
+        `UPDATE municipality_stats
+           SET treasury = treasury - ?
+         WHERE municipality_id = ? AND treasury >= ?`,
+        [totalDeducted, municipalityId, totalDeducted]
+      );
+      if (result.affectedRows > 0) {
+        // Ledger-Einträge pro Gebäude
+        const finalBalance = runningBalance; // war bereits korrekt berechnet
+        for (const le of ledgerEntries) {
+          await dbPool.query(
+            `INSERT INTO municipality_ledger
+               (municipality_id, type, amount, balance_after, debt_after, meta_json, actor_user_id, source)
+             VALUES (?, 'build_cost', ?, ?, 0, ?, ?, 'player')`,
+            [
+              municipalityId,
+              -le.cost,
+              le.balanceAfter,
+              JSON.stringify({ tool: le.tool, x: le.x, y: le.y }),
+              userId || null,
+            ]
+          );
+        }
+      }
+      // total_spent im game_stats-Blob aktualisieren (nur Statistik, kein Geld)
+      try {
+        const currentStats = await loadRoomStats(municipalityId, roomCode) || {};
+        await saveRoomStats(municipalityId, roomCode, {
+          ...currentStats,
+          total_spent: Math.max(0, Math.round(toFiniteNumber(currentStats.total_spent, 0))) + totalDeducted,
+        });
+      } catch (_) { /* total_spent ist nur Statistik, kein Fehler wenn es scheitert */ }
+    } catch (err) {
+      logError('SYNC', `Baukosten-Abzug fehlgeschlagen: ${err.message}`);
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────
 
   const newVersion =
     inserted > 0 || updated > 0 || deleted > 0

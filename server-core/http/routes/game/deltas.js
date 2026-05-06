@@ -64,9 +64,10 @@ const {
 const { isGlobalAdmin } = require('./_shared');
 
 module.exports = function registerDeltasRoutes(deps) {
-  const io = deps?.io;
 
   return async function handleDeltas(req, res, pathname, requestUrl) {
+    // io wird zur Request-Zeit gelesen, nicht beim Start (deps.io ist beim Start noch null)
+    const io = deps?.io;
 
     // ── Deltas POST ────────────────────────────────────────────
     const municipalityDeltasPostMatch = pathname.match(/^\/api\/game\/municipality\/([a-z0-9-]+)\/deltas$/i);
@@ -97,6 +98,7 @@ module.exports = function registerDeltasRoutes(deps) {
       let mapChanged = false;
       let version = await getRoomItemVersion(municipality.id, roomCode);
       let applied = 0;
+      const placedBuildingsMeta = []; // { tool, cost } pro platziertem Gebäude für Ledger-Meta
       const assignedZoneBuildings = []; // für sofortiges buildings-authoritative nach Zone-Platzierung
       const now = new Date();
       const mapMeta = await getGameMapForMunicipality(municipality.id);
@@ -486,6 +488,7 @@ module.exports = function registerDeltasRoutes(deps) {
                 total_spent: spentNow,
               };
               statsChanged = true;
+              placedBuildingsMeta.push({ tool: normalizedTool, cost: buildCost });
             }
             await dbPool.query(
               `DELETE FROM game_items
@@ -517,6 +520,54 @@ module.exports = function registerDeltasRoutes(deps) {
             }
           }
           if (!tileMutationHandled) {
+            // Footprint-Belegung: Kein Überbauen von bestehenden Gebäuden
+            const OVERWRITE_ALLOWED = new Set(['road', 'bridge', 'rail', 'subway', 'water', 'zone_water', 'zone_land']);
+            if (!OVERWRITE_ALLOWED.has(normalizedTool)) {
+              const fw = Math.max(1, Math.round(toFiniteNumber(detail?.footprint_width, 1)));
+              const fh = Math.max(1, Math.round(toFiniteNumber(detail?.footprint_height, 1)));
+              const fpPositions = [];
+              for (let fx = 0; fx < fw; fx++) {
+                for (let fy = 0; fy < fh; fy++) {
+                  fpPositions.push([x + fx, y + fy]);
+                }
+              }
+              const posConds = fpPositions.map(() => '(x = ? AND y = ?)').join(' OR ');
+              const posArgs = fpPositions.flatMap(([px, py]) => [px, py]);
+              try {
+                const [blockedItems] = await dbPool.query(
+                  `SELECT gi.id FROM game_items gi
+                   WHERE gi.municipality_id = ? AND gi.room_code = ?
+                   AND (${posConds})
+                   AND (
+                     (gi.action_type = 'place'
+                      AND gi.tool NOT IN ('road', 'bridge', 'rail', 'water', 'subway', 'grass')
+                      AND gi.tool NOT LIKE 'terrain_%'
+                      AND gi.tool NOT LIKE 'paint_%'
+                      AND gi.tool NOT LIKE 'zone_%'
+                      AND gi.tool NOT LIKE 'tree%')
+                     OR
+                     (gi.action_type = 'zone'
+                      AND gi.metadata IS NOT NULL
+                      AND gi.metadata != '{}'
+                      AND gi.metadata LIKE '%"buildingType"%'
+                      AND gi.metadata NOT LIKE '%"buildingType":""'
+                      AND gi.metadata NOT LIKE '%"buildingType":"grass"'
+                      AND gi.metadata NOT LIKE '%"buildingType":"empty"')
+                   )
+                   LIMIT 1`,
+                  [municipality.id, roomCode, ...posArgs]
+                );
+                if (Array.isArray(blockedItems) && blockedItems.length > 0) {
+                  rejectedDeltas.push({ type: 'place', tool, x, y, reason: 'tile_occupied' });
+                  continue;
+                }
+              } catch (_occupancyErr) {
+                // Check fehlgeschlagen → zur Sicherheit ablehnen
+                rejectedDeltas.push({ type: 'place', tool, x, y, reason: 'tile_occupied' });
+                continue;
+              }
+            }
+
             if (buildCost > currentMoney) {
               rejectedDeltas.push({
                 type: 'place',
@@ -538,6 +589,7 @@ module.exports = function registerDeltasRoutes(deps) {
                 total_spent: spentNow,
               };
               statsChanged = true;
+              placedBuildingsMeta.push({ tool: normalizedTool, cost: buildCost });
             }
             await dbPool.query(
               `DELETE FROM game_items
@@ -558,6 +610,32 @@ module.exports = function registerDeltasRoutes(deps) {
         }
         if (type === 'zone') {
           const normalizedZone = String(persistedZone || '').trim().toLowerCase();
+          // ── Zone-Kosten (müssen mit Client game.ts übereinstimmen) ──
+          const ZONE_COST_MAP = { residential: 50, commercial: 50, industrial: 50, none: 0 };
+          const zoneCost = ZONE_COST_MAP[normalizedZone] ?? 0;
+          if (zoneCost > currentMoney) {
+            rejectedDeltas.push({ type: 'zone', zone: normalizedZone, x, y, reason: 'insufficient_funds', required: zoneCost, available: currentMoney });
+            continue;
+          }
+          // Strassen/Schienen/Brücken nicht mit Zone überschreiben
+          if (normalizedZone !== 'none') {
+            const [roadCheck] = await dbPool.query(
+              `SELECT 1 FROM game_items
+               WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ?
+               AND action_type = 'place' AND tool IN ('road', 'bridge', 'rail', 'subway')
+               LIMIT 1`,
+              [municipality.id, roomCode, x, y]
+            );
+            if (Array.isArray(roadCheck) && roadCheck.length > 0) continue;
+          }
+
+          if (zoneCost > 0) {
+            currentMoney = Math.max(0, currentMoney - zoneCost);
+            const spentNow = Math.max(0, Math.round(toFiniteNumber(statsSnapshot.total_spent, 0))) + zoneCost;
+            statsSnapshot = { ...(statsSnapshot || {}), money: currentMoney, total_spent: spentNow };
+            statsChanged = true;
+            placedBuildingsMeta.push({ tool: `zone_${normalizedZone}`, cost: zoneCost });
+          }
           // ── Bauzone enforcement for zone deltas ──
           if (!userCanBypassBauzone) {
             const hasBauzonesZ = await bauzoneExistsForRoom();
@@ -658,17 +736,19 @@ module.exports = function registerDeltasRoutes(deps) {
         applied += 1;
       }
 
+      let newTreasury = null;
       if (statsChanged) {
         await saveRoomStats(municipality.id, roomCode, statsSnapshot);
         const totalCost = originalMoney - currentMoney;
         if (totalCost > 0) {
-          await applyMunicipalityTransaction(municipality.id, {
+          const bankResult = await applyMunicipalityTransaction(municipality.id, {
             amount: -totalCost,
             type: 'building_cost',
-            meta: { roomCode, deltasApplied: applied },
+            meta: { roomCode, deltasApplied: applied, buildings: placedBuildingsMeta },
             actorUserId: authUser?.id || null,
             source: 'user',
           });
+          newTreasury = bankResult?.treasury ?? null;
         }
       }
 
@@ -716,6 +796,7 @@ module.exports = function registerDeltasRoutes(deps) {
           rejectedDeltas,
           conflicts: [],
           newDeltas,
+          newTreasury,
         },
       });
     }

@@ -1,7 +1,8 @@
 'use strict';
 
 const http = require('http');
-const { HOST, PORT, BUENZLI_EVENTS_ENABLED, ROOM_CACHE_UNLOAD_IDLE_MS, ROOM_CACHE_FLUSH_INTERVAL_MS } = require('./config/constants');
+const fs = require('fs');
+const { HOST, PORT, BUENZLI_EVENTS_ENABLED, ROOM_CACHE_UNLOAD_IDLE_MS, ROOM_CACHE_FLUSH_INTERVAL_MS, ITEM_PRICES_OUTPUT_PATH } = require('./config/constants');
 const { logInfo, logWarn, logError, runStartupTask } = require('./infra/logger');
 const { dbPool } = require('./infra/db');
 
@@ -80,6 +81,25 @@ server.listen(PORT, HOST, () => {
         } else {
           logInfo('BOOT', `Building-Stats in DB aktualisiert: ${result.seeded} Einträge`);
         }
+      }));
+      results.push(await runStartupTask('Gebäudepreise als JSON exportieren (Client-Cache)', async () => {
+        const [priceRows] = await dbPool.query(
+          `SELECT tool, build_cost, upgrade_build_time_seconds FROM game_item_details WHERE is_active = 1`
+        );
+        const prices = {};
+        for (const row of priceRows) {
+          if (!row.tool) continue;
+          prices[String(row.tool)] = {
+            build_cost: Math.max(0, Math.round(Number(row.build_cost) || 0)),
+            upgrade_time_secs: row.upgrade_build_time_seconds != null
+              ? Math.round(Number(row.upgrade_build_time_seconds))
+              : null,
+          };
+        }
+        const dir = require('path').dirname(ITEM_PRICES_OUTPUT_PATH);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(ITEM_PRICES_OUTPUT_PATH, JSON.stringify(prices), 'utf8');
+        logInfo('BOOT', `item-prices.json geschrieben: ${priceRows.length} Gebäude → ${ITEM_PRICES_OUTPUT_PATH}`);
       }));
       results.push(await runStartupTask('Player-Counts auf 0 zurücksetzen', async () => {
         await dbPool.query(`UPDATE game_rooms SET player_count = 0 WHERE player_count > 0`);

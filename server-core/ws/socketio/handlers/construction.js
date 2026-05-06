@@ -129,24 +129,28 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
         : 0;
 
       // ── Treasury check: upgrade must be paid for ──
+      // Kosten: build_cost × 2^currentLevel
+      // L1→L2: ×2, L2→L3: ×4, L3→L4: ×8, L4→L5: ×16
       const baseCost = Math.max(0, Math.round(Number(item.build_cost || 0)));
       const upgradeCost = Math.max(0, Math.round(baseCost * Math.pow(2, currentLevel)));
+      let newTreasuryAfterUpgrade = null;
       if (upgradeCost > 0) {
-        const getRooms = require('../../../game/rooms');
-        const currentMoney = await getRooms.getMunicipalityMoney(roomMeta.municipalityId);
-        if (currentMoney < upgradeCost) {
-          if (typeof ack === 'function') ack({ success: false, error: 'insufficient_funds', required: upgradeCost, available: currentMoney });
+        const { applyMunicipalityTransaction } = require('../../../game/bank');
+        const { getBankStatus } = require('../../../game/bank');
+        const bankStatus = await getBankStatus(roomMeta.municipalityId);
+        if (bankStatus.treasury < upgradeCost) {
+          if (typeof ack === 'function') ack({ success: false, error: 'insufficient_funds', required: upgradeCost, available: bankStatus.treasury });
           return;
         }
-        await getRooms.deductMunicipalityMoney(roomMeta.municipalityId, upgradeCost);
-        const { applyMunicipalityTransaction } = require('../../../game/bank');
-        await applyMunicipalityTransaction(roomMeta.municipalityId, {
+        // applyMunicipalityTransaction bucht treasury UND schreibt Ledger-Eintrag in einem Schritt
+        const bankResult = await applyMunicipalityTransaction(roomMeta.municipalityId, {
           amount: -upgradeCost,
           type: 'upgrade_cost',
           meta: { buildingType, fromLevel: currentLevel, toLevel: targetLevel, x: tileX, y: tileY },
           actorUserId: state.currentUserId,
           source: 'user',
         });
+        newTreasuryAfterUpgrade = bankResult?.treasury ?? null;
       }
 
       const now = Date.now();
@@ -192,6 +196,7 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
             upgradeTargetLevel: targetLevel,
             upgradeSeconds,
             newLevel: upgradeSeconds === 0 ? targetLevel : currentLevel,
+            newTreasury: newTreasuryAfterUpgrade,
           },
         });
       }
@@ -268,7 +273,7 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
 
       await getRooms.deductMunicipalityMoney(roomMeta.municipalityId, repairCost);
       const { applyMunicipalityTransaction } = require('../../../game/bank');
-      await applyMunicipalityTransaction(roomMeta.municipalityId, {
+      const repairBankResult = await applyMunicipalityTransaction(roomMeta.municipalityId, {
         amount: -repairCost,
         type: 'repair_cost',
         meta: { buildingType: item.tool, x: tileX, y: tileY },
@@ -320,11 +325,185 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
       if (typeof ack === 'function') {
         ack({
           success: true,
-          data: { repairCost, constructionProgress: 60, constructionStartedAt: now },
+          data: { repairCost, constructionProgress: 60, constructionStartedAt: now, newTreasury: repairBankResult?.treasury ?? null },
         });
       }
     } catch (err) {
       logError('REPAIR', 'Fehler beim Reparieren', { error: err?.message, tileX, tileY });
+      if (typeof ack === 'function') ack({ success: false, error: 'server_error' });
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════
+  // MOVE-BUILDING
+  // ══════════════════════════════════════════════════════════════
+  socket.on('move-building', async (data = {}, ack = null) => {
+    if (rateLimiter('move-building')) {
+      if (typeof ack === 'function') ack({ success: false, error: 'rate_limited' });
+      return;
+    }
+    if (!state.currentRoomKey || !state.currentUserId) {
+      if (typeof ack === 'function') ack({ success: false, error: 'not_authenticated' });
+      return;
+    }
+    try {
+      const { getUserMunicipalityRole } = require('../../../game/municipality');
+      const liveRole = await getUserMunicipalityRole(state.currentUserId, state.socketMunicipalityId);
+      state.socketMunicipalityRole = liveRole;
+      if (!canBuildInMunicipality(liveRole)) {
+        if (typeof ack === 'function') ack({ success: false, error: 'no_permission' });
+        return;
+      }
+    } catch {
+      if (!canBuildInMunicipality(state.socketMunicipalityRole)) {
+        if (typeof ack === 'function') ack({ success: false, error: 'no_permission' });
+        return;
+      }
+    }
+
+    const fromX = Number(data.fromX);
+    const fromY = Number(data.fromY);
+    const toX = Number(data.toX);
+    const toY = Number(data.toY);
+    const flipped = !!data.flipped;
+
+    if (!Number.isFinite(fromX) || !Number.isFinite(fromY) || !Number.isFinite(toX) || !Number.isFinite(toY)) {
+      if (typeof ack === 'function') ack({ success: false, error: 'invalid_position' });
+      return;
+    }
+    const samePosition = fromX === toX && fromY === toY;
+
+    const roomMeta = wsRoomMetadata.get(state.currentRoomKey);
+    if (!roomMeta) {
+      if (typeof ack === 'function') ack({ success: false, error: 'room_not_found' });
+      return;
+    }
+
+    const liveRole = state.socketMunicipalityRole;
+    const isCitizen = liveRole === 'citizen';
+
+    try {
+      const { dbPool } = require('../../../infra/db');
+      const { getGameMapForMunicipality } = require('../../../game/map');
+
+      // Get the building and its footprint + owner info
+      const [items] = await dbPool.query(
+        `SELECT gi.id, gi.tool, gi.metadata, gi.user_id,
+                COALESCE(gid.footprint_width, 1) AS fw,
+                COALESCE(gid.footprint_height, 1) AS fh
+         FROM game_items gi
+         LEFT JOIN game_item_details gid ON gid.tool COLLATE utf8mb4_unicode_ci = gi.tool COLLATE utf8mb4_unicode_ci
+         WHERE gi.municipality_id = ? AND gi.room_code = ? AND gi.x = ? AND gi.y = ? AND gi.action_type = 'place'
+         LIMIT 1`,
+        [roomMeta.municipalityId, roomMeta.roomCode, fromX, fromY]
+      );
+
+      if (!items || items.length === 0) {
+        if (typeof ack === 'function') ack({ success: false, error: 'building_not_found' });
+        return;
+      }
+
+      const item = items[0];
+
+      // Citizens dürfen nur ihre eigene Mansion verschieben (andere Gebäude sind Community-Gebäude)
+      if (isCitizen && item.tool === 'mansion' && item.user_id && Number(item.user_id) !== Number(state.currentUserId)) {
+        if (typeof ack === 'function') ack({ success: false, error: 'not_your_building' });
+        return;
+      }
+
+      const meta = typeof item.metadata === 'string' ? JSON.parse(item.metadata || '{}') : (item.metadata || {});
+      const fw = Math.max(1, Number(item.fw || meta.footprintWidth || 1));
+      const fh = Math.max(1, Number(item.fh || meta.footprintHeight || 1));
+
+      if (!samePosition) {
+        // Grid-Grenzen prüfen
+        const mapData = await getGameMapForMunicipality(roomMeta.municipalityId);
+        const gridSize = Number(mapData?.grid_size || 50);
+        if (toX < 0 || toY < 0 || toX + fw > gridSize || toY + fh > gridSize) {
+          if (typeof ack === 'function') ack({ success: false, error: 'out_of_bounds' });
+          return;
+        }
+
+        // Bauzone-Check für Zielfeld (gleiche Logik wie bei 'place' Delta)
+        const [mzsRows] = await dbPool.query(
+          `SELECT bauzone_mode FROM municipality_zone_settings WHERE municipality_id = ? AND room_code = ? LIMIT 1`,
+          [roomMeta.municipalityId, roomMeta.roomCode]
+        );
+        const bauzoneMode = Array.isArray(mzsRows) && mzsRows.length > 0 ? mzsRows[0].bauzone_mode : 'disabled';
+        const userMustFollowBauzone = canBuildInMunicipality(liveRole) && require('../../../auth/permissions').shouldEnforceBauzone(liveRole, bauzoneMode);
+
+        if (userMustFollowBauzone) {
+          const [bzRows] = await dbPool.query(
+            `SELECT 1 FROM game_items WHERE municipality_id = ? AND room_code = ? AND action_type = 'bauzone' LIMIT 1`,
+            [roomMeta.municipalityId, roomMeta.roomCode]
+          );
+          const hasBauzones = Array.isArray(bzRows) && bzRows.length > 0;
+          if (hasBauzones) {
+            for (let dy = 0; dy < fh; dy++) {
+              for (let dx = 0; dx < fw; dx++) {
+                const [tileBZ] = await dbPool.query(
+                  `SELECT 1 FROM game_items WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ? AND action_type = 'bauzone' LIMIT 1`,
+                  [roomMeta.municipalityId, roomMeta.roomCode, toX + dx, toY + dy]
+                );
+                if (!Array.isArray(tileBZ) || tileBZ.length === 0) {
+                  if (typeof ack === 'function') ack({ success: false, error: 'outside_bauzone' });
+                  return;
+                }
+              }
+            }
+          }
+        }
+
+        // Zielfeld auf andere Gebäude prüfen (eigenes Gebäude ausschliessen)
+        const targetCoords = [];
+        for (let dy = 0; dy < fh; dy++) {
+          for (let dx = 0; dx < fw; dx++) {
+            targetCoords.push([toX + dx, toY + dy]);
+          }
+        }
+        if (targetCoords.length > 0) {
+          const placeholders = targetCoords.map(() => '(?, ?)').join(', ');
+          const [occupied] = await dbPool.query(
+            `SELECT 1 FROM game_items
+             WHERE municipality_id = ? AND room_code = ? AND action_type = 'place'
+               AND NOT (x = ? AND y = ?)
+               AND (x, y) IN (${placeholders})
+             LIMIT 1`,
+            [roomMeta.municipalityId, roomMeta.roomCode, fromX, fromY, ...targetCoords.flat()]
+          );
+          if (occupied && occupied.length > 0) {
+            if (typeof ack === 'function') ack({ success: false, error: 'target_occupied' });
+            return;
+          }
+        }
+      }
+
+      // Metadata updaten (flipped) + Position
+      const newMeta = { ...meta, flipped };
+      await dbPool.query(
+        `UPDATE game_items SET x = ?, y = ?, metadata = ?, version = version + 1
+         WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ? AND action_type = 'place'`,
+        [toX, toY, JSON.stringify(newMeta), roomMeta.municipalityId, roomMeta.roomCode, fromX, fromY]
+      );
+
+      // Zonen unter altem Footprint mitverschie­ben (nur bei echtem Positions-Wechsel)
+      if (!samePosition) {
+        const moveDx = toX - fromX;
+        const moveDy = toY - fromY;
+        for (let oy = 0; oy < fh; oy++) {
+          for (let ox = 0; ox < fw; ox++) {
+            await dbPool.query(
+              `UPDATE game_items SET x = x + ?, y = y + ?, version = version + 1
+               WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ? AND action_type = 'zone'`,
+              [moveDx, moveDy, roomMeta.municipalityId, roomMeta.roomCode, fromX + ox, fromY + oy]
+            );
+          }
+        }
+      }
+
+      if (typeof ack === 'function') ack({ success: true });
+    } catch (err) {
+      logError('WS', 'move-building error', { error: err?.message });
       if (typeof ack === 'function') ack({ success: false, error: 'server_error' });
     }
   });
@@ -387,7 +566,7 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
       // Deduct money
       await getRooms.deductMunicipalityMoney(roomMeta.municipalityId, EXPAND_COST);
       const { applyMunicipalityTransaction } = require('../../../game/bank');
-      await applyMunicipalityTransaction(roomMeta.municipalityId, {
+      const expandBankResult = await applyMunicipalityTransaction(roomMeta.municipalityId, {
         amount: -EXPAND_COST,
         type: 'expand_city',
         meta: { oldSize: currentGridSize, newSize: newGridSize },
@@ -407,7 +586,7 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
       if (typeof ack === 'function') {
         ack({
           success: true,
-          data: { newGridSize, offset: EXPAND_TILES, cost: EXPAND_COST },
+          data: { newGridSize, offset: EXPAND_TILES, cost: EXPAND_COST, newTreasury: expandBankResult?.treasury ?? null },
         });
       }
     } catch (err) {
