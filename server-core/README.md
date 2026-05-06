@@ -1,13 +1,13 @@
-# 🏛️ Buenzlifight — Server Core
+# Buenzlifight — Server Core
 
-> Autoritativer Game-Server für **Buenzlifight** — das Schweizer Städtebau-MMO.  
-> Echtzeit-Multiplayer via Socket.IO, vollständiger Server-Game-Loop und REST-API auf Basis von rohem Node.js + MySQL.
+Autoritativer Game-Server für **Buenzlifight**, das Schweizer Städtebau-MMO.  
+Echtzeit-Multiplayer via Socket.IO, vollständiger Server-Game-Loop und REST-API — reines Node.js ohne Framework, MySQL ohne ORM.
 
-🌐 **Live:** [core.buenzlifight.ch](https://core.buenzlifight.ch) · **Frontend:** [buenzlifight.ch](https://buenzlifight.ch)
+**Live:** [core.buenzlifight.ch](https://core.buenzlifight.ch) · **Frontend:** [buenzlifight.ch](https://buenzlifight.ch)
 
 ---
 
-## ⚡ Tech Stack
+## Tech Stack
 
 | Technologie | Verwendung |
 |-------------|-----------|
@@ -20,37 +20,57 @@
 
 ---
 
-## 🗂️ Projektstruktur
+## Projektstruktur
 
 ```
 server-core/
-├── auth/                    # JWT-Authentifizierung & Middleware
-├── config/                  # Konfiguration, Konstanten, Mansion-Stats
-├── game/                    # Game-Logik (Server-autoritativ)
-│   ├── disasters.js         # Feuer, Crime-NPCs, Zonen-Wachstum, Woodcutter
-│   ├── partyEvents.js       # Party-System (Polizei-Besuche, Bussen)
-│   ├── stats.js             # Autoritativer Stats-Tick (Bevölkerung, Budget)
-│   ├── userBanking.js       # Spieler-Bankkonto (Debit/Credit)
-│   ├── rooms.js             # Room-Cache & Möbel-Verwaltung
-│   ├── buenzli.js           # Büenzli-Event-System
+├── auth/                        # JWT-Authentifizierung & Middleware
+├── config/
+│   └── constants.js             # Spielbalance-Konstanten (Preise, Limits, Timings)
+├── game/                        # Server-autoritäre Game-Logik
+│   ├── stats.js                 # Stats-Tick: Bevölkerung, Budget, LandValue, Happiness
+│   ├── disasters.js             # Crime-NPCs, Feuer, Zonen-Wachstum, Woodcutter
+│   ├── rooms.js                 # Room-Cache, Avatar-Positionen, Möbel-State
+│   ├── bank.js                  # Transaktionen, Gemeinde-Kasse, Kontoführung
+│   ├── partnerships.js          # Partnerschafts-System (Tiers, Trade, Payout)
+│   ├── parkingSystem.js         # Parkraum-Management & Bussensystem
 │   └── ...
 ├── http/
-│   └── routes/              # REST-API Routen (game, auth, social, bank)
-├── infra/                   # DB-Pool, Logger, CORS, HTTP-Helpers
+│   ├── handler.js               # HTTP-Dispatcher (registriert alle Routen)
+│   ├── shared.js                # Auth-Middleware, Response-Helpers
+│   └── routes/
+│       ├── game/                # Karten, Gebäude, Items, Rooms, Furniture, Stats ...
+│       ├── social/              # Chat, Global Chat, Partnerships, Profil, Reporter
+│       ├── bank.js              # Kontostand, Transaktionen, Überweisungen
+│       ├── companies/           # Firmen, Darlehen, Werkhof
+│       ├── marketplace.js       # Marktplatz (Handel zwischen Spielern)
+│       ├── admin.js             # Admin-Panel (Bans, Gemeinde-Verwaltung)
+│       └── support.js           # Support-Tickets
 ├── jobs/
-│   └── intervals.js         # 3s Game-Loop (Stats, Crime, Party, Werkhof)
-├── sql/                     # SQL-Migrationen (001 → 140+)
+│   └── intervals.js             # 3s Game-Loop (Stats, Crime, Party, Income-Scheduler)
 ├── ws/
-│   └── socketio/            # Socket.IO Handler (Room, Chat, Avatar, GameState)
-├── config.cfg.example       # ⚙️ Konfigurationsvorlage
-└── index.js                 # Server-Einstiegspunkt
+│   └── socketio/
+│       ├── handlers/
+│       │   ├── room.js          # Avatar spawn/move, join/leave
+│       │   ├── construction.js  # Gebäude platzieren, Teleporter, Reparatur
+│       │   └── messenger.js     # Ingame-Messenger, Nachrichten
+│       └── rateLimit.js         # WS Rate-Limiting pro Socket
+├── sql/                         # SQL-Migrationen 001 → 155
+├── public/
+│   └── badges/                  # Badge-Bilder (PNG, lokal serviert)
+├── uploads/
+│   └── minimaps/                # Minimap-PNGs pro Gemeinde
+├── config.cfg.example           # Konfigurationsvorlage
+├── index.js                     # Server-Einstiegspunkt
+└── migrate.js                   # Migrations-Runner
 ```
 
 ---
 
-## 🚀 Schnellstart
+## Schnellstart
 
 ### Voraussetzungen
+
 - Node.js 18+
 - MySQL 8.0+
 
@@ -63,17 +83,18 @@ npm install
 
 # 2. Konfiguration anlegen
 cp config.cfg.example config.cfg
-# config.cfg mit eigenen Werten befüllen (DB-Passwort, JWT-Secret, Google OAuth)
+# config.cfg mit eigenen Werten füllen
 
-# 3. Datenbank & Migrationen
+# 3. Migrationen ausführen
 node migrate.js
 
 # 4. Server starten
 node index.js
-# → Läuft auf http://127.0.0.1:4100
+# → http://127.0.0.1:4100
 ```
 
 ### Mit PM2 (Produktion)
+
 ```bash
 npm install -g pm2
 pm2 start ecosystem.config.js
@@ -82,96 +103,144 @@ pm2 save && pm2 startup
 
 ---
 
-## ⚙️ Konfiguration
-
-Kopiere `config.cfg.example` → `config.cfg`:
+## Konfiguration (`config.cfg`)
 
 ```ini
 HOST=127.0.0.1
 PORT=4100
 
-# JWT (langen zufälligen String wählen!)
-JWT_SECRET=DEIN_GEHEIMER_JWT_KEY
+JWT_SECRET=langer-zufaelliger-string
 
-# MySQL
 DB_HOST=127.0.0.1
 DB_NAME=buenzlifight
 DB_USER=root
-DB_PASSWORD=DEIN_DB_PASSWORT
+DB_PASSWORD=dein-passwort
 
-# Google OAuth 2.0
 GOOGLE_CLIENT_ID=...
 GOOGLE_CLIENT_SECRET=...
 GOOGLE_REDIRECT_URI=https://deine-domain.ch/api/auth/google/callback
 ```
 
-> ⚠️ `config.cfg` **niemals** ins Git committen — bereits in `.gitignore` eingetragen.
+> `config.cfg` ist in `.gitignore` — niemals committen.
 
 ---
 
-## 🎮 Server Game-Loop
+## Server Game-Loop
 
-Der Server führt alle **3 Sekunden** pro aktivem Room einen autoritativen Tick aus:
+Alle **3 Sekunden** pro aktivem Room:
 
 ```
-Alle 3s pro Room:
-├── 📊 Stats berechnen        (Bevölkerung, Jobs, Happiness, Budget, LandValue)
-├── 🔥 Disaster-Tick          (Feuer, Gebäudeschäden)
-├── 🏗️  Building-Upgrade-Tick  (Baufortschritt, Zonen-Wachstum)
-├── 🪓 Woodcutter-Tick        (Holzfäller-Ernte)
-├── 🔫 Crime-Tick             (Gangster/Dealer spawnen, Polizei jagt)
-├── 🎉 Party-Tick             (Polizei-Warnungen, Bussen abbuchen)
-├── 🚛 Werkhof-Status         (Reparatur-Queue, Müllabfuhr)
-└── 📡 Broadcast              (alle Daten via Socket.IO an Clients)
+├── Stats-Tick          Bevölkerung, Jobs, Happiness, Budget, LandValue
+├── Disaster-Tick       Feuer, Gebäudeschäden
+├── Building-Tick       Baufortschritt, Zonen-Wachstum
+├── Woodcutter-Tick     Holzfäller-Ernte
+├── Crime-Tick          Dealer/Gangster spawnen, Polizei jagt (12s Delay)
+├── Party-Tick          Polizei-Warnungen, Bussgelder abbuchen
+├── Income-Scheduler    Firmen-Einkommen, Partnership-Trade-Payout
+└── Broadcast           Alle Daten via Socket.IO an Clients
 ```
+
+**Crime-NPCs:** Dealer macht nur Deals (kein Diebstahl). Einbrüche nur nachts. Polizei startet Verfolgung nach 12s Delay.  
+**Partnerships:** Tiers (Bronze/Silber/Gold/Platin) mit gestaffelten Trade-Vorteilen und automatischem wöchentlichem Payout.
 
 ---
 
-## 🔌 WebSocket Events (Auswahl)
+## WebSocket Events
 
 | Event | Richtung | Beschreibung |
 |-------|----------|--------------|
 | `join-room` | C → S | Raum beitreten |
 | `avatar-spawn-request` | C → S | Avatar mit Outfit & Motto spawnen |
 | `avatar-move-request` | C → S | Avatar bewegen |
-| `room-chat` | C ↔ S | Chat-Nachrichten |
+| `room-chat` | C ↔ S | Raum-Chat |
 | `stats-authoritative` | S → C | Game-Stats Update |
 | `criminals-authoritative` | S → C | Crime-NPC Positionen & Events |
-| `party-authoritative` | S → C | Party-Status (aktive Parties) |
-| `party-police-warning` | S → C | Polizeibesuch + Busse ausgelöst |
-| `buildings-authoritative` | S → C | Gebäude-Änderungen (Upgrades, Zonen) |
+| `buildings-authoritative` | S → C | Gebäude-Updates (Upgrades, Zonen) |
 | `avatars-snapshot` | S → C | Alle Avatare beim Room-Join |
+| `party-authoritative` | S → C | Aktive Parties |
+| `party-police-warning` | S → C | Polizeibesuch + Busse |
+| `teleporter-pair` | C → S | Teleporter-Verknüpfung setzen |
 
 ---
 
-## 🗄️ Datenbankmigrationen
+## REST-API (Auswahl)
 
-Migrationen in `sql/` werden aufsteigend ausgeführt. Status wird mit SHA256-Checksum in `_migrations` gespeichert.
-
-```bash
-# Alle ausstehenden Migrationen ausführen
-node migrate.js
-
-# Einzelne Migration manuell
-node migrate-single.js sql/141_neue_tabelle.sql
-```
-
----
-
-## 📡 REST-API (Auswahl)
-
+### Auth
 | Method | Endpoint | Beschreibung |
 |--------|----------|--------------|
 | `POST` | `/api/auth/login` | Login |
 | `POST` | `/api/auth/register` | Registrierung |
-| `GET` | `/api/game/municipality/:slug/map` | Kartendaten laden |
+| `GET` | `/api/auth/google` | Google OAuth Start |
+| `GET` | `/api/auth/google/callback` | Google OAuth Callback |
+| `POST` | `/api/auth/steam` | Steam-Auth |
+
+### Game
+| Method | Endpoint | Beschreibung |
+|--------|----------|--------------|
+| `GET` | `/api/game/municipality/:slug/map` | Kartendaten |
 | `POST` | `/api/game/municipality/:slug/items` | Gebäude platzieren |
-| `POST` | `/api/game/municipality/:slug/mansion-party/start` | Party starten |
-| `POST` | `/api/game/municipality/:slug/mansion-party/stop` | Party beenden |
-| `GET` | `/api/users/me/profile` | Eigenes Profil |
-| `PUT` | `/api/users/me/motto` | Motto speichern |
+| `DELETE` | `/api/game/municipality/:slug/items/:id` | Gebäude abreissen |
+| `GET` | `/api/game/municipality/:slug/stats` | Aktuelle Stats |
+| `GET` | `/api/game/municipality/:slug/deltas` | Delta-Updates (Sync) |
+| `GET` | `/api/game/room/:id/furniture` | Möbel im Raum |
+| `POST` | `/api/game/room/:id/furniture` | Möbel platzieren |
+| `GET` | `/api/game/shop/furniture` | Shop-Katalog |
+| `POST` | `/api/game/room/:id/moderation/ban` | Spieler aus Raum sperren |
+
+### Social
+| Method | Endpoint | Beschreibung |
+|--------|----------|--------------|
+| `GET` | `/api/social/global-chat` | Globaler Chat (neueste Nachrichten) |
+| `POST` | `/api/social/global-chat` | Nachricht in globalem Chat senden |
+| `GET` | `/api/social/municipality-chat/:slug` | Gemeinde-Chat |
+| `GET` | `/api/social/partnerships` | Eigene Partnerschaften |
+| `POST` | `/api/social/partnerships/request` | Partnerschaftsanfrage senden |
+| `POST` | `/api/social/partnerships/trade` | Trade-Angebot erstellen |
+| `GET` | `/api/social/profile/:uuid` | Spielerprofil |
+| `POST` | `/api/social/block` | Spieler blockieren |
+
+### Bank
+| Method | Endpoint | Beschreibung |
+|--------|----------|--------------|
 | `GET` | `/api/bank/me` | Kontostand & Transaktionen |
+| `POST` | `/api/bank/transfer` | Überweisung |
+| `GET` | `/api/bank/municipality/:slug/treasury` | Gemeindekasse |
+
+### Firmen & Marktplatz
+| Method | Endpoint | Beschreibung |
+|--------|----------|--------------|
+| `POST` | `/api/companies/found` | Firma gründen |
+| `GET` | `/api/companies/my` | Eigene Firmen |
+| `POST` | `/api/companies/:id/loan` | Darlehen aufnehmen |
+| `GET` | `/api/marketplace` | Marktplatz-Angebote |
 
 ---
 
-*Made with ❤️ in der Schweiz 🇨🇭*
+## Datenbankmigrationen
+
+Migrationen liegen in `sql/` (001–155) und werden aufsteigend ausgeführt. Jede Migration wird mit SHA256-Checksum in der `_migrations`-Tabelle gespeichert — bereits ausgeführte Migrationen werden übersprungen.
+
+```bash
+# Alle ausstehenden Migrationen
+node migrate.js
+
+# Einzelne Migration manuell
+node migrate-single.js sql/155_user_blocks.sql
+
+# Status anzeigen
+npm run migrate:status
+```
+
+---
+
+## Weitere Dienste
+
+| Dienst | Verzeichnis | Beschreibung |
+|--------|-------------|--------------|
+| **Discord-Bot** | `../discord-bot/` | Ingame-Events → Discord-Kanal |
+| **Electron-App** | `../electron-app/` | Windows-Desktop-Client (Steam-Build) |
+| **Frontend** | `../mapGame/` | Next.js Client ([Buenzli-Game](https://github.com/mgatschet91-dot/Buenzli-Game)) |
+
+---
+
+*Made in der Schweiz 🇨🇭*
