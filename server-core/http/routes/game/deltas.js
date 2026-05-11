@@ -197,7 +197,7 @@ module.exports = function registerDeltasRoutes(deps) {
             }
           }
           const [existingRows] = await dbPool.query(
-            `SELECT id
+            `SELECT id, metadata
              FROM game_items
              WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ? AND action_type IN ('place', 'zone')
              LIMIT 1`,
@@ -228,11 +228,30 @@ module.exports = function registerDeltasRoutes(deps) {
             };
             statsChanged = true;
           }
+          // Delete the origin tile
           await dbPool.query(
             `DELETE FROM game_items
              WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ? AND action_type IN ('place', 'zone')`,
             [municipality.id, roomCode, x, y]
           );
+          // Also delete secondary footprint tiles (empty placeholders) if this is a multi-tile building
+          try {
+            const originMeta = (() => { try { return JSON.parse(existingRows[0]?.metadata || '{}'); } catch { return {}; } })();
+            const fw = Math.max(1, Math.round(Number(originMeta.footprintWidth || 1)));
+            const fh = Math.max(1, Math.round(Number(originMeta.footprintHeight || 1)));
+            if (fw > 1 || fh > 1) {
+              for (let dy = 0; dy < fh; dy++) {
+                for (let dx = 0; dx < fw; dx++) {
+                  if (dx === 0 && dy === 0) continue; // already deleted above
+                  await dbPool.query(
+                    `DELETE FROM game_items
+                     WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ? AND action_type IN ('place', 'zone')`,
+                    [municipality.id, roomCode, x + dx, y + dy]
+                  );
+                }
+              }
+            }
+          } catch (_) {}
           mapChanged = true;
           applied += 1;
           continue;
@@ -641,7 +660,7 @@ module.exports = function registerDeltasRoutes(deps) {
             const hasBauzonesZ = await bauzoneExistsForRoom();
             if (hasBauzonesZ) {
               const [tileBZZ] = await dbPool.query(
-                `SELECT 1 FROM game_items
+                `SELECT zone_type FROM game_items
                  WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ? AND action_type = 'bauzone'
                  LIMIT 1`,
                 [municipality.id, roomCode, x, y]
@@ -649,6 +668,16 @@ module.exports = function registerDeltasRoutes(deps) {
               const tileIsBauzoneZ = Array.isArray(tileBZZ) && tileBZZ.length > 0;
               if (!tileIsBauzoneZ) {
                 rejectedDeltas.push({ type: 'zone', zone: normalizedZone, x, y, reason: 'outside_bauzone' });
+                continue;
+              }
+              // Typ-Check: Mischzone erlaubt alles, spezifische Zonen nur den passenden Typ
+              const bzType = tileBZZ[0]?.zone_type || 'mixed';
+              const allowedZones = bzType === 'mixed' ? ['residential', 'commercial', 'industrial'] :
+                                   bzType === 'residential' ? ['residential'] :
+                                   bzType === 'commercial'  ? ['commercial'] :
+                                   bzType === 'industrial'  ? ['industrial'] : [];
+              if (!allowedZones.includes(normalizedZone)) {
+                rejectedDeltas.push({ type: 'zone', zone: normalizedZone, x, y, reason: 'wrong_bauzone_type' });
                 continue;
               }
             }

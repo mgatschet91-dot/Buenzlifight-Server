@@ -338,6 +338,7 @@ async function processTradeIncomePayouts() {
        INNER JOIN municipalities pm ON pm.id = p.partner_municipality_id
        WHERE p.status = 'connected'
          AND p.trade_income > 0
+         AND p.road_connected = 1
          AND (p.last_trade_payout_at IS NULL OR DATE(p.last_trade_payout_at) < CURDATE())`
     );
   } catch {
@@ -413,17 +414,28 @@ async function computeExportCapacity(municipalityId) {
   ensureDbEnabled();
   const validTools = Object.keys(EXPORT_SLOT_CONFIG);
   const placeholders = validTools.map(() => '?').join(',');
-  // Kein action_type-Filter — Fabriken können 'place' oder andere action_types haben
+  // Zone-Gebäude (durch Zoning gebaut) haben tool='industrial', echter Typ in metadata.buildingType
+  // Place-Gebäude haben den Typ direkt im tool-Feld
   const [rows] = await dbPool.query(
-    `SELECT tool, COUNT(*) AS cnt
+    `SELECT
+       CASE
+         WHEN action_type = 'place' THEN tool
+         WHEN action_type = 'zone'  THEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.buildingType'))
+       END AS effective_tool,
+       COUNT(*) AS cnt
      FROM game_items
-     WHERE municipality_id = ? AND tool IN (${placeholders})
-     GROUP BY tool`,
-    [municipalityId, ...validTools]
+     WHERE municipality_id = ?
+       AND (
+         (action_type = 'place' AND tool IN (${placeholders}))
+         OR
+         (action_type = 'zone' AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.buildingType')) IN (${placeholders}))
+       )
+     GROUP BY effective_tool`,
+    [municipalityId, ...validTools, ...validTools]
   );
   let slots = 0;
   for (const row of (Array.isArray(rows) ? rows : [])) {
-    const s = EXPORT_SLOT_CONFIG[row.tool];
+    const s = EXPORT_SLOT_CONFIG[row.effective_tool];
     if (s) slots += s * Number(row.cnt || 1);
   }
   return { slots, multiplier: slotsToMultiplier(slots) };
@@ -549,10 +561,25 @@ async function getActionCooldowns(municipalityId, partnerMunicipalityId) {
   return cooldowns;
 }
 
+/**
+ * Setzt road_connected für eine Partnerschaft.
+ * Wird vom Client aufgerufen wenn sich der Strassenstatus ändert.
+ */
+async function updateRoadConnected(municipalityId, partnerMunicipalityId, connected) {
+  ensureDbEnabled();
+  await dbPool.query(
+    `UPDATE game_partnerships
+        SET road_connected = ?
+      WHERE municipality_id = ? AND partner_municipality_id = ?`,
+    [connected ? 1 : 0, municipalityId, partnerMunicipalityId]
+  );
+}
+
 module.exports = {
   TIER_CONFIG,
   DIPLOMATIC_ACTIONS,
   processTradeIncomePayouts,
+  updateRoadConnected,
   EXPORT_SLOT_CONFIG,
   computeTierProgress,
   computeExportCapacity,

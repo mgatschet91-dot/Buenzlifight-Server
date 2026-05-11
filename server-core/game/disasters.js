@@ -180,14 +180,14 @@ function getServerTargetLevelByElapsedHours(seedBase, elapsedHours) {
   return Math.max(1, Math.min(5, level));
 }
 
-// === Neue langsamere Level-Progression mit Bodenwert/Service/Demand Modifiern ===
+// === Level-Progression: max ~7 Tage bis L5 ===
 function getSlowUpgradeHourRangeForLevel(fromLevel) {
   switch (Number(fromLevel)) {
-    case 1: return [0.5, 1.5];   // L1->L2: 30 min bis 1.5h
-    case 2: return [2, 4];        // L2->L3: 2-4h
-    case 3: return [6, 12];       // L3->L4: 6-12h
-    case 4: return [12, 24];      // L4->L5: 12-24h
-    default: return [24, 48];
+    case 1: return [6, 12];    // L1->L2: 6-12h
+    case 2: return [18, 30];   // L2->L3: 18-30h (~1 Tag)
+    case 3: return [42, 60];   // L3->L4: 42-60h (~2 Tage)
+    case 4: return [60, 66];   // L4->L5: 60-66h (~2.5 Tage)
+    default: return [168, 240];
   }
 }
 
@@ -220,7 +220,14 @@ function getServerTargetLevel(seedBase, elapsedHours, landValue, serviceCoverage
       break;
     }
   }
-  return Math.max(1, Math.min(5, level));
+  // Max-Level Cap: wie Original — LandValue + ServiceCoverage + Demand bestimmen das Ceiling.
+  // floor(lv/24 + svc/28 + demandBoost) → bei Standard (lv=50, svc=50) max L3, für L5 braucht es hohen LandValue UND gute Services.
+  const lvComponent  = Math.max(0, Math.min(200, landValue || 50)) / 24;
+  const svcComponent = Math.max(0, Math.min(100, serviceCoverage || 0)) / 28;
+  const demandBoost  = Math.max(0, ((zoneDemand || 0) - 30) / 70) * 0.7;
+  const maxLevelByConditions = Math.min(5, Math.max(1, Math.floor(lvComponent + svcComponent + demandBoost)));
+
+  return Math.max(1, Math.min(maxLevelByConditions, level));
 }
 
 function canUpgradeTool(tool) {
@@ -282,7 +289,20 @@ function buildRoomGrid(rows) {
     const x = Number(row.x);
     const y = Number(row.y);
     if (!Number.isInteger(x) || !Number.isInteger(y)) continue;
-    grid.set(`${x},${y}`, row);
+    const key = `${x},${y}`;
+    const existing = grid.get(key);
+    if (existing) {
+      // Merge zone_type from 'zone' row with building data from 'place' row
+      if (row.action_type === 'place' && existing.action_type === 'zone') {
+        grid.set(key, { ...row, zone_type: existing.zone_type || row.zone_type });
+      } else if (row.action_type === 'zone' && existing.action_type === 'place') {
+        grid.set(key, { ...existing, zone_type: row.zone_type || existing.zone_type });
+      } else {
+        grid.set(key, row);
+      }
+    } else {
+      grid.set(key, row);
+    }
   }
   return grid;
 }
@@ -292,12 +312,28 @@ function isServerMergeableTile(tileRow, tileMeta, targetZone, isOriginTile, allo
     const zone = String(tileRow?.zone_type || '').trim().toLowerCase();
     return zone === targetZone && tileMeta.onFire !== true;
   }
-  const zone = String(tileRow?.zone_type || '').trim().toLowerCase();
-  if (zone !== targetZone) return false;
   if (tileMeta.onFire === true) return false;
   if (tileMeta.abandoned === true) return false;
+
+  // 'empty' tiles sind immer Platzhalter eines anderen Multi-Tile-Gebäudes — nie claimbar.
+  // Entspricht dem Original: "empty tiles must NOT be merged"
   const bt = String(metaValue(tileMeta, 'buildingType', 'building_type') || tileRow?.tool || '').trim().toLowerCase();
-  if (SERVER_MERGEABLE_TYPES.has(bt) || bt === 'grass') return true;
+  if (bt === 'empty') return false;
+
+  // Alle nicht-Origin Tiles müssen in derselben Zone sein.
+  // Entspricht dem Original: "if (tile.zone !== zone) return false"
+  const zone = String(tileRow?.zone_type || '').trim().toLowerCase();
+  if (zone !== targetZone) return false;
+
+  // Bestehende Multi-Tile-Gebäude-Origins können nie Secondary-Tiles werden
+  const fw = Number(tileMeta.footprintWidth || 1);
+  const fh = Number(tileMeta.footprintHeight || 1);
+  if (fw > 1 || fh > 1) return false;
+
+  // Gras/leere Zone-Tiles in der korrekten Zone sind immer mergeable
+  if (SERVER_MERGEABLE_TYPES.has(bt) || bt === 'grass' || bt === '') return true;
+
+  // Bestehende kleine Gebäude in der Zone bei hoher Nachfrage
   if (allowBuildingConsolidation) {
     const consolidatable = SERVER_CONSOLIDATABLE_BUILDINGS[targetZone];
     if (consolidatable && consolidatable.has(bt)) {
@@ -305,7 +341,6 @@ function isServerMergeableTile(tileRow, tileMeta, targetZone, isOriginTile, allo
       return cp >= 100 || tileMeta.constructed === true;
     }
   }
-  if (bt === 'empty') return false;
   return false;
 }
 
@@ -319,12 +354,13 @@ function findServerConsolidationFootprint(grid, x, y, width, height, zone, allow
         for (let dx = 0; dx < width && available; dx++) {
           const key = `${ox + dx},${oy + dy}`;
           const tileRow = grid.get(key);
+          const isOrigin = ox + dx === x && oy + dy === y;
           if (!tileRow) {
-            available = false;
-            break;
+            // Kein DB-Row = keine Zone gesetzt. Wie das Original:
+            // alle Tiles (auch Secondary) müssen in der richtigen Zone sein.
+            available = false; break;
           }
           const tileMeta = toJsonValue(tileRow.metadata) || {};
-          const isOrigin = ox + dx === x && oy + dy === y;
           if (!isServerMergeableTile(tileRow, tileMeta, zone, isOrigin, allowBuildingConsolidation)) {
             available = false;
           }
@@ -595,7 +631,7 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
             if (targetLevel > currentLevel) {
               nextMeta = {
                 ...nextMeta,
-                level: targetLevel,
+                level: currentLevel + 1,
                 serverLevelAuthoritative: true,
               };
             }
@@ -662,6 +698,8 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
                         nextMeta.constructionProgress = 0;
                         nextMeta.constructed = false;
                         nextMeta.abandoned = false;
+                        nextMeta.footprintWidth = targetSize.width;
+                        nextMeta.footprintHeight = targetSize.height;
                       } else {
                         if (!tileRow) continue;
                         const originMeta = { ...(toJsonValue(tileRow.metadata) || {}) };
@@ -671,6 +709,8 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
                         originMeta.constructionProgress = 0;
                         originMeta.constructed = false;
                         originMeta.abandoned = false;
+                        originMeta.footprintWidth = targetSize.width;
+                        originMeta.footprintHeight = targetSize.height;
                         currentVersion += 1;
                         await dbPool.query(
                           `UPDATE game_items SET metadata = ?, version = ?, client_timestamp = ?, applied_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -685,13 +725,18 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
                           buildingType: targetEvolutionType,
                           constructionProgress: 0,
                           constructed: false,
+                          footprintWidth: targetSize.width,
+                          footprintHeight: targetSize.height,
                         });
                       }
                     } else {
-                      // Nicht-Origin Tile: immer leeren – direkt via Koordinaten (robust,
-                      // unabhängig davon ob das Tile im roomGrid-Snapshot vorhanden ist)
+                      // Nicht-Origin Tile: immer leeren.
+                      // originX/Y mitspeichern damit buildStateFromItems bei Place-Items korrekt
+                      // erkennt, dass dieser Tile zu einem Multi-Tile-Gebäude gehört.
                       const emptyMeta = JSON.stringify({
                         buildingType: 'empty',
+                        originX: ox,
+                        originY: oy,
                         level: 0,
                         constructionProgress: 100,
                         constructed: true,
@@ -704,15 +749,32 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
                         Object.assign(nextMeta, JSON.parse(emptyMeta));
                       } else {
                         currentVersion += 1;
+                        // Zuerst eventuelle 'place'-Rows löschen: JSON_MERGE_PATCH würde
+                        // das 'tool'-Feld (z.B. 'shop_medium') stehen lassen, was
+                        // buildStateFromItems als echtes Gebäude interpretiert.
                         await dbPool.query(
+                          `DELETE FROM game_items WHERE municipality_id=? AND room_code=? AND x=? AND y=? AND action_type='place'`,
+                          [municipalityId, roomCode, tx, ty]
+                        );
+                        // Dann 'zone'-Row auf empty setzen (vollständige Metadata, kein MERGE)
+                        const [upRes] = await dbPool.query(
                           `UPDATE game_items
-                           SET metadata = JSON_MERGE_PATCH(COALESCE(metadata, '{}'), ?),
+                           SET metadata = ?,
                                version = ?, client_timestamp = ?, applied_at = ?,
                                updated_at = CURRENT_TIMESTAMP
                            WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ?
-                             AND action_type IN ('place', 'zone')`,
+                             AND action_type = 'zone'`,
                           [emptyMeta, currentVersion, timestamp, now, municipalityId, roomCode, tx, ty]
                         );
+                        if ((upRes?.affectedRows || 0) === 0) {
+                          // Kein zone-Row vorhanden (reine Grass-Tile ohne DB-Eintrag)
+                          await dbPool.query(
+                            `INSERT INTO game_items
+                               (municipality_id, room_code, x, y, action_type, tool, metadata, version, client_timestamp, applied_at, updated_at)
+                             VALUES (?, ?, ?, ?, 'zone', 'grass', ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+                            [municipalityId, roomCode, tx, ty, emptyMeta, currentVersion, timestamp, now]
+                          );
+                        }
                         updated += 1;
                       }
                       changedTiles.push({
@@ -723,6 +785,29 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
                         buildingType: 'empty',
                         constructionProgress: 100,
                         constructed: true,
+                      });
+                    }
+
+                    // Update roomGrid snapshot so subsequent consolidations in this tick
+                    // see the claimed tiles and don't overlap with this footprint.
+                    const existingGridRow = roomGrid.get(tk);
+                    if (isOrigin) {
+                      const snapMeta = isCurrentRow ? { ...nextMeta } : {
+                        buildingType: targetEvolutionType,
+                        footprintWidth: targetSize.width,
+                        footprintHeight: targetSize.height,
+                        level: evolLevel,
+                        constructed: false,
+                        constructionProgress: 0,
+                      };
+                      roomGrid.set(tk, {
+                        ...(existingGridRow || { municipality_id: municipalityId, room_code: roomCode, x: tx, y: ty, action_type: 'zone', tool: 'grass', zone_type: zoneCategory }),
+                        metadata: JSON.stringify(snapMeta),
+                      });
+                    } else {
+                      roomGrid.set(tk, {
+                        ...(existingGridRow || { municipality_id: municipalityId, room_code: roomCode, x: tx, y: ty, action_type: 'zone', tool: 'grass', zone_type: zoneCategory }),
+                        metadata: JSON.stringify({ buildingType: 'empty', originX: ox, originY: oy }),
                       });
                     }
                   }
@@ -754,6 +839,8 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
         buildingType: String(nextMeta.buildingType || row.tool || ''),
         constructionProgress: Number(nextMeta.constructionProgress ?? meta.constructionProgress ?? 100),
         constructed: Boolean(nextMeta.constructed ?? meta.constructed ?? true),
+        footprintWidth: Number(nextMeta.footprintWidth || 1),
+        footprintHeight: Number(nextMeta.footprintHeight || 1),
       });
     }
 

@@ -15,6 +15,19 @@ const { pushDiscordEvent } = require('../shared/discord.js');
 let buenzliLastGenerateTime = 0;
 const BUENZLI_GENERATION_INTERVAL_MS = 4 * 3600 * 1000; // Alle 4 Stunden neue Events
 
+function broadcastCantonalStats(io, municipalityId, fields) {
+  if (!io) return;
+  try {
+    const { wsRoomMetadata } = require('../ws/socketio/index.js');
+    for (const [roomKey, meta] of wsRoomMetadata.entries()) {
+      if (Number(meta.municipalityId) === Number(municipalityId)) {
+        io.to(roomKey).emit('stats-authoritative', { ...fields, serverTimestamp: Date.now() });
+        break;
+      }
+    }
+  } catch (_) {}
+}
+
 async function applyStatChange(municipalityId, statName, changeAmount, reason, refType = null, refId = null) {
   ensureDbEnabled();
   const validStats = ['security', 'attractiveness', 'cleanliness', 'infrastructure', 'transparency'];
@@ -210,14 +223,16 @@ async function generateBuenzliEventsForMunicipality(municipalityId) {
   if (currentActive >= BUENZLI_EVENTS_PER_DAY_MAX) return 0;
 
   let cantonalActive = false;
+  let cantonalStage = 0;
   try {
     const [cantonalCheck] = await dbPool.query(
-      `SELECT cantonal_investigation_until FROM municipality_stats WHERE municipality_id = ?`,
+      `SELECT cantonal_investigation_until, cantonal_investigation_stage FROM municipality_stats WHERE municipality_id = ?`,
       [municipalityId]
     );
     cantonalActive =
       cantonalCheck[0]?.cantonal_investigation_until &&
       new Date(cantonalCheck[0].cantonal_investigation_until) > new Date();
+    cantonalStage = cantonalActive ? (cantonalCheck[0]?.cantonal_investigation_stage || 1) : 0;
   } catch (_) {}
 
   // Pro 4h-Zyklus: 1-3 Events (statt 4-10 taeglich)
@@ -225,7 +240,10 @@ async function generateBuenzliEventsForMunicipality(municipalityId) {
   const CYCLE_MAX = 3;
   const maxNew = Math.max(0, BUENZLI_EVENTS_PER_DAY_MAX - currentActive);
   let baseGenerate = CYCLE_MIN + Math.floor(Math.random() * (CYCLE_MAX - CYCLE_MIN + 1));
-  if (cantonalActive) baseGenerate = Math.min(baseGenerate * 2, CYCLE_MAX * 2);
+  if (cantonalActive) {
+    const stageMultiplier = cantonalStage >= 2 ? 3 : 2;
+    baseGenerate = Math.min(baseGenerate * stageMultiplier, CYCLE_MAX * stageMultiplier);
+  }
   const toGenerate = Math.min(maxNew, baseGenerate);
   if (toGenerate <= 0) return 0;
 
@@ -274,7 +292,7 @@ async function generateBuenzliEventsForMunicipality(municipalityId) {
         municipalityId,
         building?.room_code || null,
         chosen.id,
-        Math.min(5, chosen.severity + (cantonalActive ? 1 : 0)),
+        Math.min(5, chosen.severity + Math.min(2, cantonalStage)),
         confidence,
         actualReal,
         chosen.min_level,
@@ -300,7 +318,7 @@ async function generateBuenzliEventsForMunicipality(municipalityId) {
   return generatedCount;
 }
 
-async function expireBuenzliEvents() {
+async function expireBuenzliEvents(io = null) {
   ensureDbEnabled();
 
   // Events in leeren Gemeinden (ohne Mitglieder) still ablaufen lassen — KEIN Stat-Schaden
@@ -450,14 +468,61 @@ async function expireBuenzliEvents() {
     }
   }
 
-  await checkCantonalInvestigation();
+  await checkCantonalInvestigation(io);
   return expired;
 }
 
-async function checkCantonalInvestigation() {
+async function checkCantonalInvestigation(io = null) {
   ensureDbEnabled();
   const { createNotificationForAllMembers } = require('./notifications.js');
   try {
+    // Pass 0: Abgelaufene Untersuchungen beenden (VOR Pass 1 — verhindert Sofort-Neustart)
+    const [justExpired] = await dbPool.query(
+      `SELECT municipality_id, cantonal_investigation_stage, cantonal_investigation_until
+       FROM municipality_stats
+       WHERE cantonal_investigation_until IS NOT NULL
+         AND cantonal_investigation_until <= NOW()
+         AND cantonal_investigation_stage > 0`
+    );
+    for (const row of justExpired) {
+      const mid = row.municipality_id;
+      const finalStage = row.cantonal_investigation_stage;
+      if (finalStage >= 3) {
+        try {
+          const { applyMunicipalityTransaction } = require('./bank.js');
+          await applyMunicipalityTransaction(mid, {
+            amount: -2000,
+            type: 'cantonal_conclusion_fine',
+            meta: { finalStage },
+            source: 'system',
+            allowOverdraft: true,
+          });
+        } catch (_) {}
+      }
+      await dbPool.query(
+        `UPDATE municipality_stats
+         SET cantonal_investigation_stage = 0, cantonal_investigation_since = NULL, updated_at = NOW()
+         WHERE municipality_id = ?`,
+        [mid]
+      );
+      const stageDesc = finalStage >= 3
+        ? 'Kritische Eskalation — Zusatzbusse CHF 2000 abgezogen.'
+        : finalStage === 2 ? 'Verschärfte Untersuchung abgeschlossen.'
+        : 'Untersuchung regulär abgeschlossen.';
+      await createNotificationForAllMembers(mid, {
+        type: 'cantonal_investigation_ended',
+        title: 'Kantonale Untersuchung abgeschlossen',
+        message: `Die kantonale Untersuchung ist beendet. ${stageDesc}`,
+        icon: 'checkmark',
+      });
+      broadcastCantonalStats(io, mid, {
+        cantonal_investigation_until: row.cantonal_investigation_until,
+        cantonal_investigation_since: null,
+        cantonal_investigation_stage: 0,
+      });
+    }
+
+    // Pass 1: Neue Untersuchungen starten
     const [candidates] = await dbPool.query(
       `SELECT ms.municipality_id, ms.transparency, ms.cantonal_investigation_until,
               m.name AS municipality_name, m.canton_name
@@ -489,7 +554,11 @@ async function checkCantonalInvestigation() {
         const durationHours = 48 + Math.floor(Math.random() * 25);
         const until = new Date(Date.now() + durationHours * 3600000);
         await dbPool.query(
-          `UPDATE municipality_stats SET cantonal_investigation_until = ?, updated_at = NOW()
+          `UPDATE municipality_stats
+           SET cantonal_investigation_until = ?,
+               cantonal_investigation_since = NOW(),
+               cantonal_investigation_stage = 1,
+               updated_at = NOW()
            WHERE municipality_id = ?`,
           [until, muni.municipality_id]
         );
@@ -506,23 +575,105 @@ async function checkCantonalInvestigation() {
           duration_hours: durationHours,
           message: `Kanton ${muni.canton_name || 'Bern'} hat Untersuchung gegen ${muni.municipality_name} eingeleitet! Grund: ${reason}.`,
         });
+        broadcastCantonalStats(io, muni.municipality_id, {
+          cantonal_investigation_until: until.toISOString(),
+          cantonal_investigation_since: new Date().toISOString(),
+          cantonal_investigation_stage: 1,
+        });
       }
     }
 
+    // Pass 2 + 3: Aktive Untersuchungen — Eskalation + stündliche Penalties
     const [activeInvestigations] = await dbPool.query(
-      `SELECT municipality_id FROM municipality_stats
+      `SELECT municipality_id, transparency, cantonal_investigation_since, cantonal_investigation_stage
+       FROM municipality_stats
        WHERE cantonal_investigation_until IS NOT NULL AND cantonal_investigation_until > NOW()`
     );
-    for (const inv of activeInvestigations) {
+
+    for (const row of activeInvestigations) {
+      const mid = row.municipality_id;
+
+      // Pass 2: Stufen-Eskalation
+      const sinceMs = row.cantonal_investigation_since
+        ? new Date(row.cantonal_investigation_since).getTime()
+        : Date.now();
+      const hoursElapsed = (Date.now() - sinceMs) / 3600000;
+      let targetStage = 1;
+      if (hoursElapsed >= 48 || row.transparency < 5) targetStage = 3;
+      else if (hoursElapsed >= 24 || row.transparency < 15) targetStage = 2;
+
+      if (targetStage > (row.cantonal_investigation_stage || 1)) {
+        await dbPool.query(
+          `UPDATE municipality_stats SET cantonal_investigation_stage = ?, updated_at = NOW()
+           WHERE municipality_id = ?`,
+          [targetStage, mid]
+        );
+        const stageLabels = { 2: 'Verschärft', 3: 'Kritisch' };
+        const stageMessages = {
+          2: 'Die Untersuchung wurde verschärft! Erhöhte Penalties und Event-Rate (x3).',
+          3: 'Kritische Eskalation! Tägliche Busse CHF 2000 und maximale Stat-Penalties.',
+        };
+        await createNotificationForAllMembers(mid, {
+          type: 'cantonal_escalation',
+          title: `Kantonale Untersuchung eskaliert: Stufe ${targetStage} — ${stageLabels[targetStage]}`,
+          message: stageMessages[targetStage] || '',
+          icon: 'warning',
+        });
+        pushDiscordEvent('cantonal_escalation', {
+          municipality_id: mid,
+          stage: targetStage,
+          message: `Kantonale Untersuchung eskaliert auf Stufe ${targetStage} (${stageLabels[targetStage]})!`,
+        });
+        broadcastCantonalStats(io, mid, { cantonal_investigation_stage: targetStage });
+        row.cantonal_investigation_stage = targetStage; // für Pass 3 aktualisieren
+      }
+
+      // Pass 3: Stündliche Penalties (Dedup-Check VOR allen applyStatChange-Aufrufen)
       const [recentPenalty] = await dbPool.query(
         `SELECT COUNT(*) AS cnt FROM municipality_stats_log
          WHERE municipality_id = ? AND reason = 'cantonal_ongoing'
            AND created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)`,
-        [inv.municipality_id]
+        [mid]
       );
-      if ((recentPenalty[0]?.cnt || 0) === 0) {
-        await applyStatChange(inv.municipality_id, 'transparency', -1, 'cantonal_ongoing', 'investigation', inv.municipality_id);
-        await applyStatChange(inv.municipality_id, 'attractiveness', -1, 'cantonal_ongoing', 'investigation', inv.municipality_id);
+      if ((recentPenalty[0]?.cnt || 0) > 0) continue;
+
+      const stage = row.cantonal_investigation_stage || 1;
+      if (stage === 1) {
+        await applyStatChange(mid, 'transparency', -1, 'cantonal_ongoing', 'investigation', mid);
+        await applyStatChange(mid, 'attractiveness', -1, 'cantonal_ongoing', 'investigation', mid);
+      } else if (stage === 2) {
+        await applyStatChange(mid, 'transparency', -2, 'cantonal_ongoing', 'investigation', mid);
+        await applyStatChange(mid, 'attractiveness', -1, 'cantonal_ongoing', 'investigation', mid);
+        await applyStatChange(mid, 'security', -1, 'cantonal_ongoing', 'investigation', mid);
+      } else if (stage >= 3) {
+        await applyStatChange(mid, 'transparency', -3, 'cantonal_ongoing', 'investigation', mid);
+        await applyStatChange(mid, 'attractiveness', -2, 'cantonal_ongoing', 'investigation', mid);
+        await applyStatChange(mid, 'security', -2, 'cantonal_ongoing', 'investigation', mid);
+        // Tägliche Busse Stufe 3 (Dedup via municipality_stats_log + CURDATE)
+        const [todayFine] = await dbPool.query(
+          `SELECT COUNT(*) AS cnt FROM municipality_stats_log
+           WHERE municipality_id = ? AND reason = 'cantonal_stage3_fine'
+             AND created_at >= CURDATE()`,
+          [mid]
+        );
+        if ((todayFine[0]?.cnt || 0) === 0) {
+          try {
+            const { applyMunicipalityTransaction } = require('./bank.js');
+            await applyMunicipalityTransaction(mid, {
+              amount: -2000,
+              type: 'cantonal_fine',
+              meta: { stage: 3 },
+              source: 'system',
+              allowOverdraft: true,
+            });
+            await dbPool.query(
+              `INSERT INTO municipality_stats_log
+               (municipality_id, stat_name, old_value, new_value, change_amount, reason, ref_type, ref_id)
+               VALUES (?, 'treasury', 0, 0, -2000, 'cantonal_stage3_fine', 'investigation', ?)`,
+              [mid, mid]
+            );
+          } catch (_) {}
+        }
       }
     }
   } catch (err) {
@@ -749,7 +900,7 @@ async function resolveBuenzliEvent(eventId, userId, opts = {}) {
   if (events.length === 0) throw new Error('Event nicht gefunden');
   const event = events[0];
 
-  if (!['reported', 'investigating', 'assigned', 'external_reported'].includes(event.status)) {
+  if (!['detected', 'reported', 'investigating', 'assigned', 'external_reported'].includes(event.status)) {
     throw new Error('Event kann nicht behoben werden (aktueller Status: ' + event.status + ')');
   }
 
@@ -818,11 +969,12 @@ async function resolveBuenzliEvent(eventId, userId, opts = {}) {
   };
 }
 
-async function runBuenzliEventTick() {
+async function runBuenzliEventTick(deps = {}) {
   if (!dbPool || !BUENZLI_EVENTS_ENABLED) return;
+  const io = deps?.io || null;
   try {
     // Immer expire-check
-    await expireBuenzliEvents();
+    await expireBuenzliEvents(io);
 
     // Neue Events alle 4 Stunden generieren (nicht nur 1x/Tag)
     const now = Date.now();

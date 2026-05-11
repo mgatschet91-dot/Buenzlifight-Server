@@ -56,18 +56,14 @@ async function getAchievementProgressSnapshot(municipalityId, roomCode) {
 
   try {
     const rooms = require('./rooms');
-    if (typeof rooms.recomputeAuthoritativePopulationAndJobs === 'function') {
-      const stats = await rooms.recomputeAuthoritativePopulationAndJobs(municipalityId, safeRoomCode);
-      if (stats && typeof stats === 'object') {
-        population = Number(stats.population) || 0;
-        jobs = Number(stats.jobs) || 0;
-        money = Number(stats.money);
-        if (!Number.isFinite(money)) money = 0;
-      }
+    const stats = await rooms.loadRoomStats(municipalityId, safeRoomCode);
+    if (stats && typeof stats === 'object') {
+      // stats_data is nested: population.current, employment.jobs, finances.money
+      population = Number(stats.population?.current ?? stats.population) || 0;
+      jobs       = Number(stats.employment?.jobs   ?? stats.jobs)        || 0;
+      money      = Number(stats.finances?.money    ?? stats.money)       || 0;
     }
-  } catch (_) {
-    // recomputeAuthoritativePopulationAndJobs may not exist in rooms.js yet
-  }
+  } catch (_) {}
 
   if (!Number.isFinite(money) || money === 0) {
     try {

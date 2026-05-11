@@ -297,7 +297,7 @@ async function seedBuildingStatsToDb() {
   return { seeded };
 }
 
-async function fetchItemDetails(tool) {
+async function fetchItemDetails(tool, cantonCode = null) {
   ensureDbEnabled();
   const fallbackItemDetails = {
     water_tower: {
@@ -316,7 +316,7 @@ async function fetchItemDetails(tool) {
     },
   };
 
-  const colsFull = 'tool, display_name, category, furni_classname, furni_logic, catalog_page_id, footprint_width, footprint_height, build_cost, daily_income, pollution, max_pop, max_jobs, power_production, power_consumption_base, land_value, build_cost AS price, build_time_seconds, upgrade_build_time_seconds, requires_power, requires_water, is_active, updated_at';
+  const colsFull = 'tool, display_name, category, furni_classname, furni_logic, catalog_page_id, footprint_width, footprint_height, build_cost, daily_income, pollution, max_pop, max_jobs, power_production, power_consumption_base, land_value, build_cost AS price, build_time_seconds, upgrade_build_time_seconds, requires_power, requires_water, is_active, canton_code, updated_at';
   const colsSafe = 'tool, display_name, category, furni_classname, furni_logic, catalog_page_id, footprint_width, footprint_height, build_cost, daily_income, build_cost AS price, build_time_seconds, requires_power, requires_water, is_active, updated_at';
 
   if (tool) {
@@ -337,9 +337,10 @@ async function fetchItemDetails(tool) {
     return fallbackItemDetails[tool] || null;
   }
   let rows;
+  const cantonFilter = cantonCode ? ` AND (canton_code IS NULL OR canton_code = ${dbPool.escape(cantonCode)})` : '';
   try {
     [rows] = await dbPool.query(
-      `SELECT ${colsFull} FROM game_item_details WHERE is_active = 1 ORDER BY category ASC, tool ASC`
+      `SELECT ${colsFull} FROM game_item_details WHERE is_active = 1${cantonFilter} ORDER BY category ASC, tool ASC`
     );
   } catch (e) {
     [rows] = await dbPool.query(

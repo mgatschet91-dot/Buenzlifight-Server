@@ -16,6 +16,8 @@ const {
 } = require('./helpers');
 
 module.exports = function registerWorkTaskRoutes(deps) {
+  const io = deps?.io || null;
+  const { createNotificationForAllMembers } = require('../../../game/notifications.js');
   return async function handleWorkTasks(req, res, pathname, requestUrl) {
 
     // ================================================================
@@ -132,11 +134,22 @@ module.exports = function registerWorkTaskRoutes(deps) {
       const event = events[0];
 
       const [companyRows] = await dbPool.query(
-        `SELECT c.*, ct.can_fix_categories FROM companies c
+        `SELECT c.*, ct.can_fix_categories, ct.code AS type_code FROM companies c
          JOIN company_types ct ON ct.id = c.company_type_id
          WHERE c.id = ? AND c.is_active = 1`, [companyId]
       );
       if (companyRows.length === 0) return sendJson(res, 404, { ok: false, error: 'Firma nicht gefunden' });
+
+      const company = companyRows[0];
+      const canFix = typeof company.can_fix_categories === 'string'
+        ? JSON.parse(company.can_fix_categories)
+        : (company.can_fix_categories || []);
+      if (!canFix.includes(event.category)) {
+        return sendJson(res, 400, {
+          ok: false,
+          error: `Diese Firma (${company.type_code}) kann keine Events der Kategorie "${event.category}" bearbeiten`,
+        });
+      }
 
       const [existingContract] = await dbPool.query(
         `SELECT id FROM company_contracts WHERE event_id = ?`, [eventId]
@@ -670,6 +683,102 @@ module.exports = function registerWorkTaskRoutes(deps) {
       } catch (err) {
         return sendJson(res, 400, { ok: false, error: err.message });
       }
+    }
+
+    // POST /api/verwaltung/cantonal-investigation/resolve — Untersuchung vorzeitig beilegen
+    if (req.method === 'POST' && pathname === '/api/verwaltung/cantonal-investigation/resolve') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (!authUser.municipality_id) return sendJson(res, 400, { ok: false, error: 'Keine Gemeinde zugeordnet' });
+
+      const [memberRole] = await dbPool.query(
+        `SELECT role FROM municipality_memberships WHERE municipality_id = ? AND user_id = ?`,
+        [authUser.municipality_id, authUser.id]
+      );
+      if (!memberRole[0] || !['owner', 'admin'].includes(memberRole[0].role)) {
+        return sendJson(res, 403, { ok: false, error: 'Nur Bürgermeister/Admin dürfen die Untersuchung beilegen' });
+      }
+
+      const [statsRows] = await dbPool.query(
+        `SELECT cantonal_investigation_until, cantonal_investigation_stage, transparency
+         FROM municipality_stats WHERE municipality_id = ?`,
+        [authUser.municipality_id]
+      );
+      const stats = statsRows[0];
+      if (!stats) return sendJson(res, 404, { ok: false, error: 'Gemeindedaten nicht gefunden' });
+
+      const isActive = stats.cantonal_investigation_until &&
+        new Date(stats.cantonal_investigation_until) > new Date();
+      if (!isActive) {
+        return sendJson(res, 400, { ok: false, error: 'Keine aktive kantonale Untersuchung' });
+      }
+      if (stats.transparency < 30) {
+        return sendJson(res, 400, {
+          ok: false,
+          error: `Transparenz zu niedrig (${stats.transparency}/100). Mindestens 30 Punkte erforderlich.`,
+        });
+      }
+
+      const RESOLUTION_COSTS = { 1: 5000, 2: 10000, 3: 20000 };
+      const stage = stats.cantonal_investigation_stage || 1;
+      const cost = RESOLUTION_COSTS[stage] || 5000;
+
+      const treasury = await getMunicipalityMoney(authUser.municipality_id);
+      if (treasury < cost) {
+        return sendJson(res, 400, {
+          ok: false,
+          error: `Nicht genug Geld in der Gemeindekasse (${cost.toLocaleString('de-CH')} CHF nötig, Kasse: ${Math.floor(treasury).toLocaleString('de-CH')} CHF)`,
+        });
+      }
+
+      await applyMunicipalityTransaction(authUser.municipality_id, {
+        amount: -cost,
+        type: 'cantonal_resolution',
+        meta: { stage },
+        actorUserId: authUser.id,
+        source: 'user',
+      });
+
+      await dbPool.query(
+        `UPDATE municipality_stats
+         SET cantonal_investigation_until = NULL,
+             cantonal_investigation_since = NULL,
+             cantonal_investigation_stage = 0,
+             updated_at = NOW()
+         WHERE municipality_id = ?`,
+        [authUser.municipality_id]
+      );
+
+      await createNotificationForAllMembers(authUser.municipality_id, {
+        type: 'cantonal_investigation_resolved',
+        title: 'Kantonale Untersuchung beigelegt',
+        message: `Die Untersuchung wurde offiziell beigelegt (CHF ${cost.toLocaleString('de-CH')} bezahlt).`,
+        icon: 'checkmark',
+        amount: -cost,
+      });
+
+      if (io) {
+        try {
+          const { wsRoomMetadata } = require('../../../ws/socketio/index.js');
+          for (const [roomKey, meta] of wsRoomMetadata.entries()) {
+            if (Number(meta.municipalityId) === Number(authUser.municipality_id)) {
+              io.to(roomKey).emit('stats-authoritative', {
+                cantonal_investigation_until: null,
+                cantonal_investigation_since: null,
+                cantonal_investigation_stage: 0,
+                serverTimestamp: Date.now(),
+              });
+              break;
+            }
+          }
+        } catch (_) {}
+      }
+
+      return sendJson(res, 200, {
+        ok: true,
+        data: { resolved: true, cost, stage, message: `Untersuchung erfolgreich beigelegt (CHF ${cost.toLocaleString('de-CH')})` },
+      });
     }
 
   };

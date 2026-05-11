@@ -312,7 +312,7 @@ function registerIntervals(deps) {
   // 4) Buenzli event tick (every 60s)
   intervals.push(setInterval(async () => {
     try {
-      await getBuenzli().runBuenzliEventTick();
+      await getBuenzli().runBuenzliEventTick(deps);
     } catch (err) {
       logError('INTERVAL', 'Buenzli tick error', { error: err?.message });
     }
@@ -815,6 +815,75 @@ function registerIntervals(deps) {
       logError('INCOME', 'Einnahmen-Scheduler Fehler', { error: err?.message });
     }
   }, 5 * 60 * 1000)); // alle 5 Minuten prüfen, aber nur gutschreiben wenn 60 Min rum
+
+  // 19) Firmen-Auftrags-Cleanup (alle 5min)
+  //   a) Abgelaufene offene Contracts → failed
+  //   b) Verwaiste Events: Contract completed/failed/cancelled aber Event noch aktiv → resolved/failed
+  intervals.push(setInterval(async () => {
+    try {
+      const { dbPool } = require('../infra/db.js');
+      if (!dbPool) return;
+
+      // a) Contracts mit abgelaufener Deadline die noch offen sind → failed
+      const [expired] = await dbPool.query(
+        `SELECT id, event_id FROM company_contracts
+         WHERE status IN ('open', 'accepted', 'assigned')
+           AND deadline_at < NOW()`
+      );
+      if (expired.length > 0) {
+        const contractIds = expired.map(r => r.id);
+        const eventIds    = [...new Set(expired.map(r => r.event_id).filter(Boolean))];
+
+        await dbPool.query(
+          `UPDATE company_contracts SET status = 'failed' WHERE id IN (?)`,
+          [contractIds]
+        );
+        if (eventIds.length > 0) {
+          await dbPool.query(
+            `UPDATE municipality_events
+             SET status = 'failed', resolved_at = NOW()
+             WHERE id IN (?)
+               AND status NOT IN ('resolved','expired','false_alarm','failed')`,
+            [eventIds]
+          );
+        }
+        logInfo('JOBS', `Contract-Cleanup: ${expired.length} abgelaufene Auftraege auf failed gesetzt`);
+      }
+
+      // b) Events deren Contract completed/failed/cancelled ist aber Event noch aktiv hängt
+      const [orphaned] = await dbPool.query(
+        `SELECT me.id AS event_id, cc.status AS contract_status
+         FROM municipality_events me
+         JOIN company_contracts cc ON cc.event_id = me.id
+         WHERE me.status NOT IN ('resolved','expired','false_alarm','failed')
+           AND cc.status IN ('completed','failed','cancelled')`
+      );
+      if (orphaned.length > 0) {
+        const orphanEventIds = orphaned.map(r => r.event_id);
+        // completed contract → event resolved, sonst failed
+        const completedEventIds = orphaned.filter(r => r.contract_status === 'completed').map(r => r.event_id);
+        const failedEventIds    = orphaned.filter(r => r.contract_status !== 'completed').map(r => r.event_id);
+
+        if (completedEventIds.length > 0) {
+          await dbPool.query(
+            `UPDATE municipality_events SET status = 'resolved', resolved_at = NOW()
+             WHERE id IN (?) AND status NOT IN ('resolved','expired','false_alarm','failed')`,
+            [completedEventIds]
+          );
+        }
+        if (failedEventIds.length > 0) {
+          await dbPool.query(
+            `UPDATE municipality_events SET status = 'failed', resolved_at = NOW()
+             WHERE id IN (?) AND status NOT IN ('resolved','expired','false_alarm','failed')`,
+            [failedEventIds]
+          );
+        }
+        logInfo('JOBS', `Contract-Cleanup: ${orphanEventIds.length} verwaiste Events bereinigt`);
+      }
+    } catch (err) {
+      logError('JOBS', 'Contract-Expiry-Tick Fehler', { error: err?.message });
+    }
+  }, 5 * 60 * 1000));
 
   logInfo('JOBS', `${intervals.length} Intervalle registriert`);
   return intervals;

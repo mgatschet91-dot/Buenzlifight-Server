@@ -2,6 +2,7 @@
 
 const { sendJson } = require('../../../infra/http');
 const { getAuthenticatedUser } = require('../../../auth/middleware');
+const { dbPool } = require('../../../infra/db');
 
 const {
   fetchItemDetails,
@@ -12,12 +13,27 @@ const {
   fetchCantonMunicipalities,
 } = require('../../../game/municipality');
 
+async function getCantonCodeForUser(authUser) {
+  if (!authUser?.municipality_id) return null;
+  try {
+    const [rows] = await dbPool.query(
+      'SELECT canton_code FROM municipalities WHERE id = ? LIMIT 1',
+      [authUser.municipality_id]
+    );
+    return rows[0]?.canton_code || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 module.exports = function registerBuildingTypesRoutes(/* deps */) {
   return async function handleBuildingTypes(req, res, pathname /*, requestUrl */) {
 
     // ── Item-Preisliste (einmaliger Startup-Fetch vom Client) ────
     if (req.method === 'GET' && pathname === '/api/game/item-prices') {
-      const details = await fetchItemDetails(null);
+      const authUser = await getAuthenticatedUser(req).catch(() => null);
+      const cantonCode = await getCantonCodeForUser(authUser);
+      const details = await fetchItemDetails(null, cantonCode);
       const prices = {};
       for (const d of details) {
         if (!d.tool) continue;
@@ -33,7 +49,9 @@ module.exports = function registerBuildingTypesRoutes(/* deps */) {
 
     // ── Building types ─────────────────────────────────────────
     if (req.method === 'GET' && pathname === '/api/game/building-types') {
-      const details = await fetchItemDetails(null);
+      const authUser = await getAuthenticatedUser(req).catch(() => null);
+      const cantonCode = await getCantonCodeForUser(authUser);
+      const details = await fetchItemDetails(null, cantonCode);
       const categories = {
         residential: [],
         commercial: [],
@@ -53,6 +71,7 @@ module.exports = function registerBuildingTypesRoutes(/* deps */) {
           icon: d.tool,
           base_cost: Number(d.build_cost || 0),
           price: Number((d.price ?? d.build_cost) || 0),
+          canton_code: d.canton_code || null,
         });
       }
       return sendJson(res, 200, { success: true, data: categories });

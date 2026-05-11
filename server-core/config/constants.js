@@ -210,7 +210,7 @@ const PUBLIC_ROOM_SIZE_PRESETS = {
 
 const DEFAULT_ACHIEVEMENTS = [
   { code: 'first_steps', title: 'Erste Schritte', description: 'Baue mindestens 10 Gebäude in deiner Gemeinde.', goal_type: 'building_count', goal_value: 10, reward_xp: 50, reward_money: 1000, sort_order: 10 },
-  { code: 'city_hall_built', title: 'Rathaus steht', description: 'Errichte ein City Hall Gebäude.', goal_type: 'city_hall_count', goal_value: 1, reward_xp: 80, reward_money: 2500, sort_order: 20 },
+  { code: 'city_hall_built', title: 'Rathaus steht', description: 'Errichte ein Rathaus in deiner Gemeinde.', goal_type: 'city_hall_count', goal_value: 1, reward_xp: 80, reward_money: 2500, sort_order: 20 },
   { code: 'population_100', title: 'Dorfleben', description: 'Erreiche 100 Einwohner.', goal_type: 'population', goal_value: 100, reward_xp: 100, reward_money: 3000, sort_order: 30 },
   { code: 'population_500', title: 'Kleinstadt', description: 'Erreiche 500 Einwohner.', goal_type: 'population', goal_value: 500, reward_xp: 220, reward_money: 7000, sort_order: 40 },
   { code: 'jobs_200', title: 'Wirtschaft läuft', description: 'Erreiche 200 Arbeitsplätze.', goal_type: 'jobs', goal_value: 200, reward_xp: 120, reward_money: 3500, sort_order: 50 },

@@ -21,11 +21,26 @@
 const { dbPool, ensureDbEnabled } = require('../infra/db.js');
 const { logError } = require('../infra/logger.js');
 
+// ── Kennzeichen-Generierung (identisch mit Frontend-Hash) ─────────────────────
+const CH_CANTONS = ['AG','AI','AR','BE','BL','BS','FR','GE','GL','GR','JU','LU','NE','NW','OW','SG','SH','SO','SZ','TG','TI','UR','VD','VS','ZG','ZH'];
+function _hashVehicle(tileX, tileY, slot, color) {
+  let h = 0;
+  const s = `${tileX}|${tileY}|${slot}|${color}`;
+  for (let i = 0; i < s.length; i++) h = Math.imul(31, h) + s.charCodeAt(i) | 0;
+  return Math.abs(h);
+}
+function _getPlate(tileX, tileY, slot, color) {
+  const h = _hashVehicle(tileX, tileY, slot, color);
+  const canton = CH_CANTONS[h % CH_CANTONS.length];
+  const num = 100 + (Math.abs(_hashVehicle(tileX + 1, tileY + 1, slot + 1, color)) % 99900);
+  return `${canton} ${num}`;
+}
+
 // Bussen-Aufteilung
-const FINE_AMOUNT  = 80;  // CHF Gesamtbusse
-const FINE_COMMUNE = 50;  // → Gemeindekasse
-const FINE_COMPANY = 20;  // → Security-Firma
-// 10 CHF verbleiben als Aufwandsentschädigung
+const FINE_AMOUNT  = 50;  // CHF Gesamtbusse
+const FINE_COMMUNE = 30;  // → Gemeindekasse
+const FINE_COMPANY = 15;  // → Security-Firma (NPC-Kontrolleur)
+//  5 CHF verbleiben als Aufwandsentschädigung
 
 // ── Ledger-Eintrag schreiben ──────────────────────────────────────────────────
 async function _ledger(municipalityId, type, amount, metaJson = null) {
@@ -226,10 +241,14 @@ async function runParkingControlTick(broadcastToRoom) {
       const maxPerTick = kontrolleur_count * 2;
 
       const [violations] = await dbPool.query(
-        `SELECT id, tile_x, tile_y, slot, fine_amount
-         FROM parking_violations
-         WHERE municipality_id = ? AND status = 'unpaid'
-         ORDER BY created_at ASC LIMIT ?`,
+        `SELECT pv.id, pv.tile_x, pv.tile_y, pv.slot, pv.fine_amount,
+                pveh.color AS vehicle_color
+         FROM parking_violations pv
+         LEFT JOIN parked_vehicles pveh
+           ON pveh.municipality_id = pv.municipality_id
+          AND pveh.tile_x = pv.tile_x AND pveh.tile_y = pv.tile_y AND pveh.slot = pv.slot
+         WHERE pv.municipality_id = ? AND pv.status = 'unpaid'
+         ORDER BY pv.created_at ASC LIMIT ?`,
         [municipality_id, maxPerTick]
       );
 
@@ -254,10 +273,13 @@ async function runParkingControlTick(broadcastToRoom) {
       const totalCompany = FINE_COMPANY * violations.length;
       await dbPool.query(`UPDATE companies SET balance = balance + ? WHERE id = ?`, [totalCompany, company_id]);
 
-      // Batch: company_finances-Einträge per Bulk-Insert
-      const financeValues = violations.map(() => `(?, ?, (SELECT balance FROM companies WHERE id = ?), 'parking_fine_provision')`).join(',');
-      const financeParams = violations.flatMap(() => [company_id, FINE_COMPANY, company_id]);
-      await dbPool.query(`INSERT INTO company_finances (company_id, amount, balance_after, reason) VALUES ${financeValues}`, financeParams);
+      // Batch: company_finances-Einträge per Bulk-Insert (mit Kennzeichen als description)
+      const financeValues = violations.map(() => `(?, ?, (SELECT balance FROM companies WHERE id = ?), 'parking_fine_provision', ?)`).join(',');
+      const financeParams = violations.flatMap(v => {
+        const plate = v.vehicle_color ? _getPlate(v.tile_x, v.tile_y, v.slot, v.vehicle_color) : null;
+        return [company_id, FINE_COMPANY, company_id, plate ? `🚗 ${plate}` : null];
+      });
+      await dbPool.query(`INSERT INTO company_finances (company_id, amount, balance_after, reason, description) VALUES ${financeValues}`, financeParams);
 
       // Ledger-Einträge (1 pro Verstoss für Nachvollziehbarkeit)
       for (const v of violations) {
@@ -283,6 +305,103 @@ async function runParkingControlTick(broadcastToRoom) {
     );
   } catch (err) {
     logError('PARKING', 'runParkingControlTick Fehler', { error: err?.message });
+  }
+}
+
+// ── Manuelle Kontrolle durch Parkraum-Security-Mitarbeiter ───────────────────
+// Gibt zurück: { ok, hasViolation, userPayout, companyPayout, communePayout, error }
+const FINE_MANUAL_COMMUNE = 25;  // → Gemeindekasse
+const FINE_MANUAL_COMPANY = 10;  // → Firma
+const FINE_MANUAL_USER    = 15;  // → User der gefunden hat
+// Total: 50 CHF
+
+async function manualKontrolle(tileX, tileY, slot, userId) {
+  ensureDbEnabled();
+  try {
+    // User muss Mitglied irgendeiner aktiven parkraum_security-Firma sein
+    const [[membership]] = await dbPool.query(
+      `SELECT cm.company_id, c.name AS company_name, c.municipality_id
+       FROM company_members cm
+       JOIN companies c ON c.id = cm.company_id
+       JOIN company_types ct ON ct.id = c.company_type_id
+       WHERE cm.user_id = ? AND ct.code = 'parkraum_security' AND c.is_active = 1
+       LIMIT 1`,
+      [userId]
+    );
+    if (!membership) return { ok: false, error: 'Nicht Mitglied einer Parkraum-Security-Firma' };
+
+    const municipalityId = membership.municipality_id;
+
+    // Offenen Verstoss auf diesem Slot suchen (in der Gemeinde der Firma)
+    const [[violation]] = await dbPool.query(
+      `SELECT id, fine_amount FROM parking_violations
+       WHERE municipality_id = ? AND tile_x = ? AND tile_y = ? AND slot = ? AND status = 'unpaid'
+       LIMIT 1`,
+      [municipalityId, tileX, tileY, slot]
+    );
+
+    if (!violation) return { ok: true, hasViolation: false };
+
+    // Farbe lesen bevor das Fahrzeug gelöscht wird (für Kennzeichen)
+    const [[vehicle]] = await dbPool.query(
+      `SELECT color FROM parked_vehicles WHERE municipality_id = ? AND tile_x = ? AND tile_y = ? AND slot = ? LIMIT 1`,
+      [municipalityId, tileX, tileY, slot]
+    );
+    const plate = vehicle?.color ? _getPlate(tileX, tileY, slot, vehicle.color) : null;
+
+    // Verstoss als gebüsst markieren, User als Finder eintragen
+    await dbPool.query(
+      `UPDATE parking_violations
+       SET status = 'fined', security_company_id = ?, fined_at = NOW(),
+           found_by_user_id = ?, user_payout = ?
+       WHERE id = ?`,
+      [membership.company_id, userId, FINE_MANUAL_USER, violation.id]
+    );
+
+    // Fahrzeug wegschicken (fährt nach Busse weg)
+    await dbPool.query(
+      `DELETE FROM parked_vehicles WHERE municipality_id = ? AND tile_x = ? AND tile_y = ? AND slot = ?`,
+      [municipalityId, tileX, tileY, slot]
+    );
+
+    // Gemeindekasse
+    await dbPool.query(
+      `UPDATE municipality_stats SET treasury = treasury + ? WHERE municipality_id = ?`,
+      [FINE_MANUAL_COMMUNE, municipalityId]
+    );
+    await _ledger(municipalityId, 'parking_fine_manual', FINE_MANUAL_COMMUNE, {
+      violationId: violation.id, tileX, tileY, slot,
+      companyId: membership.company_id, foundByUserId: userId,
+    });
+
+    // Firma
+    await dbPool.query(`UPDATE companies SET balance = balance + ? WHERE id = ?`, [FINE_MANUAL_COMPANY, membership.company_id]);
+    await dbPool.query(
+      `INSERT INTO company_finances (company_id, amount, balance_after, reason, description)
+       VALUES (?, ?, (SELECT balance FROM companies WHERE id = ?), 'parking_fine_provision', ?)`,
+      [membership.company_id, FINE_MANUAL_COMPANY, membership.company_id, plate ? `🚗 ${plate}` : `Tile ${tileX}/${tileY} Slot ${slot}`]
+    );
+
+    // User-Bankkonto
+    const { creditUserBankAccount } = require('./userBanking');
+    await creditUserBankAccount(userId, {
+      amount: FINE_MANUAL_USER,
+      type: 'parking_fine_finder',
+      meta: { tileX, tileY, slot, companyName: membership.company_name, violationId: violation.id },
+    });
+
+    return {
+      ok: true,
+      hasViolation: true,
+      municipalityId: municipalityId,
+      userPayout:    FINE_MANUAL_USER,
+      companyPayout: FINE_MANUAL_COMPANY,
+      communePayout: FINE_MANUAL_COMMUNE,
+      companyName:   membership.company_name,
+    };
+  } catch (err) {
+    logError('PARKING', 'manualKontrolle Fehler', { error: err?.message });
+    return { ok: false, error: 'Interner Fehler' };
   }
 }
 
@@ -324,4 +443,5 @@ module.exports = {
   setParkingConfig,
   getParkingConfigs,
   getParkingViolations,
+  manualKontrolle,
 };

@@ -22,6 +22,7 @@ const { invalidateRoomItemsCache } = require('../../../jobs/intervals');
 
 const {
   formatGameItemRow,
+  fetchItemDetails,
 } = require('../../../game/building');
 
 const { touchMunicipalityActivity } = require('../../../game/municipality');
@@ -245,6 +246,36 @@ module.exports = function registerItemsRoutes(deps) {
       const items = Array.isArray(body.items) ? body.items : null;
       if (!items) return sendJson(res, 422, { ok: false, error: 'items muss ein Array sein' });
       if (items.length > 5000) return sendJson(res, 422, { ok: false, error: 'Maximal 5000 Items erlaubt' });
+
+      // Canton-restriction check: reject syncs that contain canton-locked tools
+      try {
+        const [cantonRows] = await dbPool.query(
+          'SELECT canton_code FROM municipalities WHERE id = ? LIMIT 1',
+          [municipality.id]
+        );
+        const municipalityCantonCode = cantonRows[0]?.canton_code || null;
+        const distinctTools = [...new Set(items.map((i) => i.tool || i.furni_classname).filter(Boolean))];
+        if (distinctTools.length > 0) {
+          const [restrictedRows] = await dbPool.query(
+            `SELECT tool FROM game_item_details WHERE tool IN (?) AND canton_code IS NOT NULL`,
+            [distinctTools]
+          );
+          for (const r of restrictedRows) {
+            const [detailRows] = await dbPool.query(
+              'SELECT canton_code FROM game_item_details WHERE tool = ? LIMIT 1',
+              [r.tool]
+            );
+            const requiredCanton = detailRows[0]?.canton_code;
+            if (requiredCanton && requiredCanton !== municipalityCantonCode) {
+              return sendJson(res, 403, {
+                ok: false,
+                error: `Das Gebäude "${r.tool}" ist nur für Gemeinden des Kantons ${requiredCanton} verfügbar.`,
+              });
+            }
+          }
+        }
+      } catch (_) {}
+
       const result = await syncRoomItems(
         municipality.id,
         roomCode,

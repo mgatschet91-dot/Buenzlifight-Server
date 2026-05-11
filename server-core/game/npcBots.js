@@ -3,6 +3,7 @@
 const { dbPool, ensureDbEnabled } = require('../infra/db.js');
 const { logError } = require('../infra/logger.js');
 const { applyMunicipalityTransaction } = require('./bank.js');
+const { calcCompanyLevel } = require('../http/routes/companies/helpers.js');
 
 // ─── Schweizer NPC-Namen ──────────────────────────────────────
 const NPC_FIRST_NAMES = [
@@ -168,7 +169,7 @@ async function runNpcBotTick() {
     // completable_at direkt im SQL prüfen — kein JS-Zeitvergleich nötig
     const [working] = await dbPool.query(
       `SELECT nb.id AS bot_id, nb.company_id, nb.efficiency, nb.contracts_completed, nb.xp_earned,
-              cc.id AS contract_id, cc.payment, cc.difficulty, cc.municipality_id,
+              cc.id AS contract_id, cc.payment, cc.difficulty, cc.municipality_id, cc.event_id,
               cc.work_duration_seconds, nb.contract_started_at
        FROM npc_bots nb
        JOIN company_contracts cc ON cc.id = nb.current_contract_id
@@ -203,6 +204,14 @@ async function runNpcBotTick() {
         `UPDATE company_contracts SET status = 'completed', completed_at = NOW() WHERE id = ?`,
         [bot.contract_id]
       );
+      // Zugehöriges Municipality-Event auf resolved setzen
+      if (bot.event_id) {
+        await dbPool.query(
+          `UPDATE municipality_events SET status = 'resolved', resolved_at = NOW(), updated_at = NOW()
+           WHERE id = ? AND status NOT IN ('resolved','expired','false_alarm','failed')`,
+          [bot.event_id]
+        );
+      }
       await dbPool.query(
         `UPDATE companies SET balance = balance + ?, reputation = reputation + ?,
                 total_contracts = total_contracts + 1, total_revenue = total_revenue + ?
@@ -210,8 +219,16 @@ async function runNpcBotTick() {
         [netPayment, bot.difficulty * 2, bot.payment, bot.company_id]
       );
 
-      const [[companyAfter]] = await dbPool.query(`SELECT balance FROM companies WHERE id = ?`, [bot.company_id]);
+      const [[companyAfter]] = await dbPool.query(`SELECT balance, reputation, level FROM companies WHERE id = ?`, [bot.company_id]);
       const balanceAfter = companyAfter ? companyAfter.balance : 0;
+
+      // Level neu berechnen (fehlte bisher — Progress Bar blieb stehen)
+      if (companyAfter) {
+        const newLevel = calcCompanyLevel(companyAfter.reputation || 0);
+        if (newLevel > (companyAfter.level || 1)) {
+          await dbPool.query(`UPDATE companies SET level = ? WHERE id = ?`, [newLevel, bot.company_id]);
+        }
+      }
 
       await dbPool.query(
         `INSERT INTO company_finances (company_id, amount, balance_after, reason, description, ref_type, ref_id)

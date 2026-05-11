@@ -479,7 +479,9 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
       }
 
       // Metadata updaten (flipped) + Position
-      const newMeta = { ...meta, flipped };
+      const incomingBuildingType = String(data.buildingType || item.tool || '');
+      const incomingLevel = Number(data.level ?? meta.level ?? 1);
+      const newMeta = { ...meta, flipped, level: incomingLevel };
       await dbPool.query(
         `UPDATE game_items SET x = ?, y = ?, metadata = ?, version = version + 1
          WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ? AND action_type = 'place'`,
@@ -502,6 +504,17 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
       }
 
       if (typeof ack === 'function') ack({ success: true });
+
+      // Alle Clients im Room über die Verschiebung informieren (damit deren Grid-State korrekt bleibt)
+      try {
+        io.to(state.currentRoomKey).emit('building-moved', {
+          fromX, fromY, toX, toY, flipped,
+          buildingType: incomingBuildingType || item.tool,
+          level: incomingLevel,
+          footprintWidth: fw,
+          footprintHeight: fh,
+        });
+      } catch (_) {}
     } catch (err) {
       logError('WS', 'move-building error', { error: err?.message });
       if (typeof ack === 'function') ack({ success: false, error: 'server_error' });

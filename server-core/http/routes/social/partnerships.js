@@ -24,6 +24,7 @@ const {
   executeDiplomaticAction,
   getActionCooldowns,
   computeExportCapacity,
+  updateRoadConnected,
 } = require('../../../game/partnerships');
 
 const { createUserNotification } = require('../../../game/notifications');
@@ -674,6 +675,37 @@ module.exports = function registerPartnershipRoutes(deps) {
       try {
         const capacity = await computeExportCapacity(municipality.id);
         return sendJson(res, 200, { success: true, data: capacity });
+      } catch (err) {
+        return sendJson(res, 400, { success: false, error: err.message });
+      }
+    }
+
+    // ── ROAD-STATUS UPDATE ─────────────────────────────────────────────────────
+    // PATCH /api/game/municipality/:slug/partnerships/:partnerSlug/road-status
+    const roadStatusMatch = pathname.match(
+      /^\/api\/game\/municipality\/([a-z0-9-]+)\/partnerships\/([a-z0-9-]+)\/road-status$/i
+    );
+    if (roadStatusMatch && req.method === 'PATCH') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { success: false, error: 'Nicht eingeloggt' });
+
+      const municipality = await getMunicipalityBySlug(roadStatusMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { success: false, error: 'Gemeinde nicht gefunden' });
+
+      const owner = await getMunicipalityOwner(municipality.id);
+      if (!owner || Number(owner.id) !== Number(authUser.id))
+        return sendJson(res, 403, { success: false, error: 'Keine Berechtigung' });
+
+      const partner = await getMunicipalityBySlug(roadStatusMatch[2].toLowerCase());
+      if (!partner) return sendJson(res, 404, { success: false, error: 'Partner-Gemeinde nicht gefunden' });
+
+      const body = await readJsonBody(req);
+      const connected = body?.connected === true || body?.connected === 1;
+
+      try {
+        await updateRoadConnected(municipality.id, partner.id, connected);
+        return sendJson(res, 200, { success: true, data: { road_connected: connected } });
       } catch (err) {
         return sendJson(res, 400, { success: false, error: err.message });
       }
