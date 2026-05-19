@@ -179,6 +179,10 @@ module.exports = function registerGameStateHandlers(socket, io, context) {
     if (!state.currentRoomKey || !state.currentPlayerId) return;
     const message = String(data.message || '').trim().slice(0, 500);
     if (!message) return;
+    // Stummschaltung prüfen — gemutete User senden keine Nachrichten (silent drop)
+    const { wsRoomMuted } = require('../../../ws/socketio/index');
+    const mutedSet = wsRoomMuted.get(state.currentRoomKey);
+    if (mutedSet && state.currentUserId && mutedSet.has(state.currentUserId)) return;
     io.to(state.currentRoomKey).emit('room-chat', {
       playerId: state.currentPlayerId,
       playerName: state.playerName,

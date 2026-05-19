@@ -2,7 +2,7 @@
 
 const { sendJson, readJsonBody } = require('../../../infra/http');
 const { ensureDbEnabled } = require('../../../infra/db');
-const { getAuthenticatedUser, getUserRankValue, getUserGlobalRole } = require('../../../auth/middleware');
+const { getAuthenticatedUser, getUserGlobalRole } = require('../../../auth/middleware');
 
 const {
   createOrGetRoom,
@@ -17,7 +17,6 @@ const {
 const {
   listPublicNavigatorMaps,
   getMunicipalityById,
-  getUserMunicipalityRole,
 } = require('../../../game/municipality');
 
 const {
@@ -29,8 +28,7 @@ const {
 
 const {
   PUBLIC_ROOM_SIZE_PRESETS,
-  MUNICIPALITY_ROLE_OWNER,
-  MUNICIPALITY_ROLE_COUNCIL,
+  GLOBAL_ROLE_MODERATOR,
   GLOBAL_ROLE_ADMINISTRATOR,
 } = require('../../../config/constants');
 
@@ -43,24 +41,10 @@ module.exports = function registerPublicMapsRoutes(/* deps */) {
       const authUser = await getAuthenticatedUser(req);
       if (!authUser) return sendJson(res, 401, { success: false, error: 'Nicht authentifiziert' });
       const resolvedGlobalRole = await getUserGlobalRole(authUser.id);
-      const resolvedUserRank = await getUserRankValue(authUser.id);
-      let hasMunicipalityCreateRights = false;
-      try {
-        const ownMunicipalityId = Number(authUser.municipality_id || 0);
-        if (ownMunicipalityId > 0) {
-          const municipalityRole = await getUserMunicipalityRole(authUser.id, ownMunicipalityId);
-          hasMunicipalityCreateRights =
-            municipalityRole === MUNICIPALITY_ROLE_OWNER || municipalityRole === MUNICIPALITY_ROLE_COUNCIL;
-        }
-      } catch {
-        hasMunicipalityCreateRights = false;
-      }
+      const normalizedRole = String(resolvedGlobalRole || '').toLowerCase();
       const canCreateMaps =
-        // Public Rooms sollen für alle eingeloggten Nutzer erstellbar sein.
-        true ||
-        Number(resolvedUserRank || 0) >= 7 ||
-        String(resolvedGlobalRole || '').toLowerCase() === GLOBAL_ROLE_ADMINISTRATOR ||
-        hasMunicipalityCreateRights;
+        normalizedRole === GLOBAL_ROLE_MODERATOR ||
+        normalizedRole === GLOBAL_ROLE_ADMINISTRATOR;
 
       if (req.method === 'GET') {
         const q = String(requestUrl.searchParams.get('q') || '');
@@ -77,7 +61,7 @@ module.exports = function registerPublicMapsRoutes(/* deps */) {
       }
 
       if (!canCreateMaps) {
-        return sendJson(res, 403, { success: false, error: 'Nur Admins dürfen neue Maps erstellen' });
+        return sendJson(res, 403, { success: false, error: 'Nur Moderatoren und Admins dürfen Offizielle Räume erstellen' });
       }
 
       try {

@@ -171,6 +171,26 @@ module.exports = function registerProfileRoutes(deps) {
     }
 
     // ================================================================
+    // EIGENE BADGES (kein Admin erforderlich)
+    // ================================================================
+
+    if (req.method === 'GET' && pathname === '/api/users/me/badges') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const [badges] = await dbPool.query(
+        `SELECT ub.badge_code AS code, b.name, b.description,
+                COALESCE(b.image_url, '') AS image_url, b.rarity, b.category
+         FROM user_badges ub
+         JOIN badges b ON b.code = ub.badge_code
+         WHERE ub.user_id = ?
+         ORDER BY b.rarity DESC, b.sort_order ASC`,
+        [authUser.id]
+      );
+      return sendJson(res, 200, { ok: true, data: { badges } });
+    }
+
+    // ================================================================
     // PROFILE
     // ================================================================
 

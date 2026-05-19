@@ -6,6 +6,7 @@ const { getAuthenticatedUser } = require('../../../auth/middleware');
 const { loadLayoutForUser, loadTemplateForUser } = require('./roomLayout');
 const { debitUserBankAccount } = require('../../../game/userBanking');
 const { getMansionTenants, startRental, endRental, getTierConfig } = require('../../../game/mansionRentals');
+const { wsRoomKey } = require('../../../ws/socketio/helpers');
 
 const RESIDENTIAL_TOOLS = new Set([
   'house_small', 'house_medium', 'mansion',
@@ -52,7 +53,7 @@ const VILLA_CATALOG = [
   { row: 4, col: 4, price: 500000, min_rank: 0, requires_council: false, requires_president: true },
 ];
 
-module.exports = function registerResidencesRoutes(_deps) {
+module.exports = function registerResidencesRoutes(deps) {
   return async function handleResidences(req, res, pathname, requestUrl) {
 
     // GET /api/game/municipality/:slug/residence/my-villa
@@ -99,7 +100,125 @@ module.exports = function registerResidencesRoutes(_deps) {
       return sendJson(res, 200, { ok: true, data: { residences: rows } });
     }
 
+    // POST /api/game/municipality/:slug/residence/place
+    // Platziert eine neue Mansion auf der Karte UND registriert sie als Residence (pre-purchase flow)
+    const placeMatch = pathname.match(/^\/api\/game\/municipality\/([^/]+)\/residence\/place$/i);
+    if (placeMatch && req.method === 'POST') {
+      ensureDbEnabled();
+      const user = await getAuthenticatedUser(req);
+      if (!user) return sendJson(res, 401, { ok: false, error: 'Nicht angemeldet' });
+      const slug = placeMatch[1];
+      const body = await readJsonBody(req);
+      const tileX = Number(body.tile_x);
+      const tileY = Number(body.tile_y);
+      const roomCode = (body.room_code || '').toString().trim();
+      if (!Number.isInteger(tileX) || !Number.isInteger(tileY) || !roomCode) {
+        return sendJson(res, 422, { ok: false, error: 'tile_x, tile_y und room_code erforderlich' });
+      }
+
+      const [muniRows] = await dbPool.query('SELECT id FROM municipalities WHERE slug = ? LIMIT 1', [slug]);
+      const muni = muniRows[0];
+      if (!muni) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      // User muss ein Design vorher gekauft haben
+      const [purchaseRows] = await dbPool.query(
+        'SELECT variant_row, variant_col, price_paid FROM user_mansion_purchases WHERE user_id = ? AND municipality_id = ? LIMIT 1',
+        [user.id, muni.id]
+      );
+      const purchase = purchaseRows[0];
+      if (!purchase) {
+        return sendJson(res, 422, { ok: false, error: 'Kaufe zuerst ein Traumhaus-Design im User-Panel (Mein Haus).' });
+      }
+
+      // Prüfen ob der Tile (2×2) schon belegt ist
+      const footprint = [[0,0],[1,0],[0,1],[1,1]];
+      for (const [dx, dy] of footprint) {
+        const [occupied] = await dbPool.query(
+          `SELECT id FROM game_items
+           WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ?
+             AND action_type IN ('place','zone')
+             AND tool NOT IN ('grass','road','bridge','rail','water','subway')
+             AND tool NOT LIKE 'terrain_%'
+           LIMIT 1`,
+          [muni.id, roomCode, tileX + dx, tileY + dy]
+        );
+        if (occupied.length > 0) {
+          return sendJson(res, 409, { ok: false, error: `Feld (${tileX+dx}/${tileY+dy}) ist bereits bebaut` });
+        }
+      }
+
+      // Tile bereits als Residence eines anderen Users?
+      const [existingRes] = await dbPool.query(
+        `SELECT user_id FROM player_residences WHERE municipality_id = ? AND room_code = ? AND tile_x = ? AND tile_y = ? LIMIT 1`,
+        [muni.id, roomCode, tileX, tileY]
+      );
+      if (existingRes[0] && existingRes[0].user_id !== user.id) {
+        return sendJson(res, 409, { ok: false, error: 'Dieser Platz ist bereits belegt' });
+      }
+
+      // Aktuelle Version holen
+      const [versionRows] = await dbPool.query(
+        'SELECT COALESCE(MAX(version), 0) AS maxv FROM game_items WHERE municipality_id = ? AND room_code = ?',
+        [muni.id, roomCode]
+      );
+      const nextVersion = Number(versionRows[0]?.maxv || 0) + 1;
+      const now = Date.now();
+
+      // Bestehende Einträge am Tile löschen (Gras, Terrain etc.) — wie im Delta-System
+      await dbPool.query(
+        `DELETE FROM game_items WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ? AND action_type IN ('place','zone')`,
+        [muni.id, roomCode, tileX, tileY]
+      );
+
+      // Mansion als game_item einfügen — mit footprint + sofort constructed
+      const mansionMeta = JSON.stringify({
+        footprintWidth: 2,
+        footprintHeight: 2,
+        constructed: true,
+        constructionProgress: 100,
+      });
+      await dbPool.query(
+        `INSERT INTO game_items
+         (municipality_id, room_code, player_id, user_id, action_type, tool, zone_type, x, y, version, client_timestamp, applied_at, metadata)
+         VALUES (?, ?, 'system', ?, 'place', 'mansion', NULL, ?, ?, ?, ?, NOW(), ?)`,
+        [muni.id, roomCode, user.id, tileX, tileY, nextVersion, now, mansionMeta]
+      );
+
+      // Socket.IO: Alle Clients im Raum sofort updaten (kein Reload nötig)
+      try {
+        const io = deps?.io;
+        if (io) {
+          const roomKey = wsRoomKey(slug, roomCode);
+          io.to(roomKey).emit('deltas', [{
+            type: 'place',
+            tool: 'mansion',
+            x: tileX,
+            y: tileY,
+            roomCode,
+            playerId: 'system',
+            timestamp: now,
+            metadata: { footprintWidth: 2, footprintHeight: 2, constructed: true, constructionProgress: 100 },
+          }]);
+        }
+      } catch { /* non-critical */ }
+
+      // Residence registrieren
+      await dbPool.query(
+        `INSERT INTO player_residences (user_id, municipality_id, room_code, tile_x, tile_y, mansion_variant_row, mansion_variant_col, villa_paid)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE room_code = VALUES(room_code), tile_x = VALUES(tile_x), tile_y = VALUES(tile_y),
+           occupied_since = NOW(),
+           mansion_variant_row = VALUES(mansion_variant_row),
+           mansion_variant_col = VALUES(mansion_variant_col),
+           villa_paid = VALUES(villa_paid)`,
+        [user.id, muni.id, roomCode, tileX, tileY, purchase.variant_row, purchase.variant_col, purchase.price_paid]
+      );
+
+      return sendJson(res, 200, { ok: true, data: { tile_x: tileX, tile_y: tileY, nickname: user.nickname } });
+    }
+
     // POST /api/game/municipality/:slug/residence/claim
+    // Beansprucht ein bereits auf der Karte stehendes Wohngebäude (älterer Flow)
     const claimMatch = pathname.match(/^\/api\/game\/municipality\/([^/]+)\/residence\/claim$/i);
     if (claimMatch && req.method === 'POST') {
       ensureDbEnabled();
@@ -113,11 +232,9 @@ module.exports = function registerResidencesRoutes(_deps) {
       if (!Number.isInteger(tileX) || !Number.isInteger(tileY) || !roomCode) {
         return sendJson(res, 422, { ok: false, error: 'tile_x, tile_y und room_code erforderlich' });
       }
-      // Look up municipality
       const [muniRows] = await dbPool.query('SELECT id FROM municipalities WHERE slug = ? LIMIT 1', [slug]);
       const muni = muniRows[0];
       if (!muni) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
-      // Nur manuell platzierte Gebäude (action_type='place') sind kaufbar — keine Zone-generierten
       const [itemRows] = await dbPool.query(
         `SELECT tool FROM game_items
          WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ? AND action_type = 'place'
@@ -128,7 +245,6 @@ module.exports = function registerResidencesRoutes(_deps) {
       if (!RESIDENCE_PRICES[tool]) {
         return sendJson(res, 422, { ok: false, error: 'Nur manuell platzierte Wohngebäude können gekauft werden' });
       }
-      // Check tile not already claimed by someone else
       const [existingRows] = await dbPool.query(
         `SELECT user_id FROM player_residences WHERE municipality_id = ? AND room_code = ? AND tile_x = ? AND tile_y = ? LIMIT 1`,
         [muni.id, roomCode, tileX, tileY]
@@ -136,8 +252,6 @@ module.exports = function registerResidencesRoutes(_deps) {
       if (existingRows[0] && existingRows[0].user_id !== user.id) {
         return sendJson(res, 409, { ok: false, error: 'Dieses Haus ist bereits belegt' });
       }
-
-      // Kaufpreis berechnen und vom Privatkonto abbuchen
       const price = RESIDENCE_PRICES[tool] || 8000;
       try {
         await debitUserBankAccount(user.id, {
@@ -149,21 +263,15 @@ module.exports = function registerResidencesRoutes(_deps) {
       } catch (err) {
         return sendJson(res, 402, { ok: false, error: err.message || 'Nicht genug Guthaben' });
       }
-      // Preis geht an Gemeindekasse
       await dbPool.query(
         'UPDATE municipality_stats SET treasury = treasury + ?, updated_at = NOW() WHERE municipality_id = ?',
         [price, muni.id]
       );
-
-      // Check if user has a pre-purchased villa design for this municipality
       const [purchaseRows] = await dbPool.query(
         'SELECT variant_row, variant_col, price_paid FROM user_mansion_purchases WHERE user_id = ? AND municipality_id = ? LIMIT 1',
         [user.id, muni.id]
       );
       const purchase = purchaseRows[0];
-      const applyVariant = tool === 'mansion' && purchase;
-
-      // UPSERT: user can only have one house per municipality (unique constraint)
       await dbPool.query(
         `INSERT INTO player_residences (user_id, municipality_id, room_code, tile_x, tile_y, mansion_variant_row, mansion_variant_col, villa_paid)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -173,9 +281,9 @@ module.exports = function registerResidencesRoutes(_deps) {
            mansion_variant_col = VALUES(mansion_variant_col),
            villa_paid = VALUES(villa_paid)`,
         [user.id, muni.id, roomCode, tileX, tileY,
-         applyVariant ? purchase.variant_row : null,
-         applyVariant ? purchase.variant_col : null,
-         applyVariant ? purchase.price_paid : 0]
+         purchase ? purchase.variant_row : null,
+         purchase ? purchase.variant_col : null,
+         purchase ? purchase.price_paid : 0]
       );
       return sendJson(res, 200, { ok: true, data: { tile_x: tileX, tile_y: tileY, nickname: user.nickname, price } });
     }
@@ -205,6 +313,13 @@ module.exports = function registerResidencesRoutes(_deps) {
       const ownerNickname = userRows[0]?.nickname || 'Unbekannt';
       const avatarCode = userRows[0]?.avatar_code || null;
 
+      // Eigenen Raumnamen aus user_room_settings holen
+      const [nameRows] = await dbPool.query(
+        'SELECT room_display_name FROM user_room_settings WHERE user_id = ? LIMIT 1',
+        [targetUserId]
+      );
+      const roomDisplayName = nameRows[0]?.room_display_name || null;
+
       // Eingeloggten User ermitteln → my_nickname für den Besucher
       let myNickname = null;
       try {
@@ -219,10 +334,11 @@ module.exports = function registerResidencesRoutes(_deps) {
       return sendJson(res, 200, {
         ok: true,
         data: {
-          model_name:     modelName,
-          avatar_code:    avatarCode,
-          owner_nickname: ownerNickname,
-          my_nickname:    myNickname,  // Name des eingeloggten Besuchers
+          model_name:        modelName,
+          avatar_code:       avatarCode,
+          owner_nickname:    ownerNickname,
+          room_display_name: roomDisplayName,
+          my_nickname:       myNickname,
           geometry,
         },
       });
@@ -280,6 +396,93 @@ module.exports = function registerResidencesRoutes(_deps) {
       if (!muni) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
       await dbPool.query('DELETE FROM player_residences WHERE user_id = ? AND municipality_id = ?', [user.id, muni.id]);
       return sendJson(res, 200, { ok: true });
+    }
+
+    // POST /api/game/municipality/:slug/residence/villa-purchase
+    // Kauft ein Villa-Design VOR der Platzierung (Pre-Purchase); wird bei claim automatisch angewendet
+    const purchaseMatch = pathname.match(/^\/api\/game\/municipality\/([^/]+)\/residence\/villa-purchase$/i);
+    if (purchaseMatch && req.method === 'POST') {
+      ensureDbEnabled();
+      const user = await getAuthenticatedUser(req);
+      if (!user) return sendJson(res, 401, { ok: false, error: 'Nicht angemeldet' });
+      const slug = purchaseMatch[1];
+      const body = await readJsonBody(req);
+      const variantRow = Number(body.variant_row);
+      const variantCol = Number(body.variant_col);
+
+      if (!Number.isInteger(variantRow) || !Number.isInteger(variantCol) ||
+          variantRow < 0 || variantRow > 4 || variantCol < 0 || variantCol > 4) {
+        return sendJson(res, 422, { ok: false, error: 'Ungültige Variante' });
+      }
+
+      const entry = VILLA_CATALOG.find(v => v.row === variantRow && v.col === variantCol);
+      if (!entry) return sendJson(res, 422, { ok: false, error: 'Unbekannte Villa-Variante' });
+
+      const [muniRows] = await dbPool.query('SELECT id FROM municipalities WHERE slug = ? LIMIT 1', [slug]);
+      const muni = muniRows[0];
+      if (!muni) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      // Bereits ein Design gekauft?
+      const [existingRows] = await dbPool.query(
+        'SELECT variant_row, variant_col FROM user_mansion_purchases WHERE user_id = ? AND municipality_id = ? LIMIT 1',
+        [user.id, muni.id]
+      );
+      if (existingRows[0]) {
+        return sendJson(res, 409, { ok: false, error: 'Du hast bereits ein Traumhaus-Design gekauft. Platziere zuerst deine Mansion.' });
+      }
+
+      // Rang-Anforderung prüfen
+      if (entry.min_rank > 0) {
+        const [rankRows] = await dbPool.query('SELECT user_rank FROM users WHERE id = ? LIMIT 1', [user.id]);
+        const userRank = Number(rankRows[0]?.user_rank || 0);
+        if (userRank < entry.min_rank) {
+          return sendJson(res, 403, { ok: false, error: `Rang ${entry.min_rank} erforderlich (du bist Rang ${userRank})` });
+        }
+      }
+
+      // Rollen-Anforderung prüfen
+      if (entry.requires_president || entry.requires_council) {
+        const [memberRows] = await dbPool.query(
+          `SELECT role FROM municipality_memberships WHERE municipality_id = ? AND user_id = ? LIMIT 1`,
+          [muni.id, user.id]
+        );
+        const role = memberRows[0]?.role || 'citizen';
+        if (entry.requires_president && role !== 'owner') {
+          return sendJson(res, 403, { ok: false, error: 'Nur der Gemeindepresident kann dieses Design wählen' });
+        }
+        if (entry.requires_council && role !== 'owner' && role !== 'council') {
+          return sendJson(res, 403, { ok: false, error: 'Nur Verwaltungsmitglieder können dieses Design wählen' });
+        }
+      }
+
+      // Privatkonto belasten
+      try {
+        await debitUserBankAccount(user.id, {
+          amount: entry.price,
+          type: 'villa_purchase',
+          reference: `villapre_${variantRow}_${variantCol}_${muni.id}`,
+          description: `Traumhaus-Design (${variantRow}/${variantCol}) in ${slug}`,
+        });
+      } catch (err) {
+        return sendJson(res, 402, { ok: false, error: err.message || 'Nicht genug Guthaben' });
+      }
+
+      // Gemeindekasse gutschreiben
+      await dbPool.query(
+        `UPDATE municipality_stats SET treasury = treasury + ?, updated_at = NOW() WHERE municipality_id = ?`,
+        [entry.price, muni.id]
+      );
+
+      // Design speichern (für spätere Platzierung)
+      await dbPool.query(
+        `INSERT INTO user_mansion_purchases (user_id, municipality_id, variant_row, variant_col, price_paid, purchased_at)
+         VALUES (?, ?, ?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE variant_row = VALUES(variant_row), variant_col = VALUES(variant_col),
+           price_paid = VALUES(price_paid), purchased_at = NOW()`,
+        [user.id, muni.id, variantRow, variantCol, entry.price]
+      );
+
+      return sendJson(res, 200, { ok: true, data: { variant_row: variantRow, variant_col: variantCol, price: entry.price } });
     }
 
     // POST /api/game/municipality/:slug/residence/villa-upgrade

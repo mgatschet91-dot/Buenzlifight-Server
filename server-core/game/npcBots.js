@@ -3,6 +3,7 @@
 const { dbPool, ensureDbEnabled } = require('../infra/db.js');
 const { logError } = require('../infra/logger.js');
 const { applyMunicipalityTransaction } = require('./bank.js');
+const { applyStatChange } = require('./buenzli.js');
 const { calcCompanyLevel } = require('../http/routes/companies/helpers.js');
 
 // ─── Schweizer NPC-Namen ──────────────────────────────────────
@@ -83,11 +84,13 @@ async function hireNpcBot(companyId, municipalityId, botType) {
   );
 
   const name = generateNpcName();
+  // Kontrolleure arbeiten immer im Patrol-Modus (keine regulären Verträge)
+  const patrolMode = (botType === 'kontrolleur') ? 1 : 0;
   const [result] = await dbPool.query(
     `INSERT INTO npc_bots
-       (company_id, municipality_id, name, bot_type, salary_weekly, efficiency, status)
-     VALUES (?, ?, ?, ?, ?, ?, 'idle')`,
-    [companyId, municipalityId, name, botType, typeRow.salary_weekly, typeRow.efficiency]
+       (company_id, municipality_id, name, bot_type, salary_weekly, efficiency, status, patrol_mode)
+     VALUES (?, ?, ?, ?, ?, ?, 'idle', ?)`,
+    [companyId, municipalityId, name, botType, typeRow.salary_weekly, typeRow.efficiency, patrolMode]
   );
 
   return { id: result.insertId, name, botType, hireCost: typeRow.hire_cost };
@@ -204,13 +207,23 @@ async function runNpcBotTick() {
         `UPDATE company_contracts SET status = 'completed', completed_at = NOW() WHERE id = ?`,
         [bot.contract_id]
       );
-      // Zugehöriges Municipality-Event auf resolved setzen
+      // Zugehöriges Municipality-Event auf resolved setzen + Stats anpassen
       if (bot.event_id) {
+        const [[evRow]] = await dbPool.query(
+          `SELECT me.status, et.stat_impact, et.stat_fix_bonus
+           FROM municipality_events me
+           JOIN event_types et ON et.id = me.event_type_id
+           WHERE me.id = ? AND me.status NOT IN ('resolved','expired','false_alarm','failed')`,
+          [bot.event_id]
+        );
         await dbPool.query(
           `UPDATE municipality_events SET status = 'resolved', resolved_at = NOW(), updated_at = NOW()
            WHERE id = ? AND status NOT IN ('resolved','expired','false_alarm','failed')`,
           [bot.event_id]
         );
+        if (evRow?.stat_impact && bot.municipality_id) {
+          await applyStatChange(bot.municipality_id, evRow.stat_impact, evRow.stat_fix_bonus || 0, 'event_fixed', 'event', bot.event_id);
+        }
       }
       await dbPool.query(
         `UPDATE companies SET balance = balance + ?, reputation = reputation + ?,
@@ -312,7 +325,7 @@ async function getCompanyNpcBots(companyId) {
   const [rows] = await dbPool.query(
     `SELECT nb.*, nbt.display_name, nbt.emoji, nbt.hire_cost, nbt.max_per_company,
             cc.id AS contract_id_active, cc.status AS contract_status,
-            cc.work_duration_seconds, nb.contract_started_at,
+            cc.work_duration_seconds, nb.contract_started_at, cc.completable_at,
             ROUND(nb.efficiency * 100) AS efficiency_pct
      FROM npc_bots nb
      JOIN npc_bot_types nbt ON nbt.bot_type = nb.bot_type

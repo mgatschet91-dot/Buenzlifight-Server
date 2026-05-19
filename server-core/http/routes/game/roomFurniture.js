@@ -4,17 +4,28 @@ const { sendJson, readJsonBody } = require('../../../infra/http');
 const { dbPool, ensureDbEnabled } = require('../../../infra/db');
 const { getAuthenticatedUser } = require('../../../auth/middleware');
 
+// Hilfsfunktion: municipality_id aus Slug oder direktem Param auflösen
+async function resolveMunicipalityId(slug, directId) {
+  if (directId && Number(directId) > 0) return Number(directId);
+  if (!slug) return null;
+  const [rows] = await dbPool.query(
+    'SELECT id FROM municipalities WHERE slug = ? AND is_active = 1 LIMIT 1',
+    [String(slug)]
+  );
+  return rows[0] ? Number(rows[0].id) : null;
+}
+
 module.exports = function registerRoomFurnitureRoutes(_deps) {
   return async function handleRoomFurniture(req, res, pathname, requestUrl) {
 
-    // GET /api/game/user/room/furniture?user_id=123
-    // Alle platzierten Möbel eines Raums (public — für Besucher)
+    // GET /api/game/user/room/furniture?user_id=123&municipality_slug=xxx
     if (pathname === '/api/game/user/room/furniture' && req.method === 'GET') {
       ensureDbEnabled();
       const params = new URL(requestUrl, 'http://x').searchParams;
       const ownerId = parseInt(params.get('user_id') || '0', 10);
+      const municipalitySlug = params.get('municipality_slug') || '';
+      const municipalityIdParam = params.get('municipality_id') || '';
 
-      // If no user_id given, require auth and use own room
       let targetId = ownerId;
       if (!targetId) {
         const user = await getAuthenticatedUser(req);
@@ -22,15 +33,27 @@ module.exports = function registerRoomFurnitureRoutes(_deps) {
         targetId = user.id;
       }
 
-      const [rows] = await dbPool.query(
-        `SELECT id, item_code, x, z, floor_level, facing_idx, wy, pair_id FROM room_furniture WHERE user_id = ? ORDER BY id ASC`,
-        [targetId]
-      );
+      const municipalityId = await resolveMunicipalityId(municipalitySlug, municipalityIdParam);
+
+      let rows;
+      if (municipalityId) {
+        [rows] = await dbPool.query(
+          `SELECT id, item_code, x, z, floor_level, facing_idx, wy, pair_id
+           FROM room_furniture WHERE user_id = ? AND municipality_id = ? ORDER BY id ASC`,
+          [targetId, municipalityId]
+        );
+      } else {
+        // Fallback ohne municipality — zeigt legacy-Daten (NULL municipality)
+        [rows] = await dbPool.query(
+          `SELECT id, item_code, x, z, floor_level, facing_idx, wy, pair_id
+           FROM room_furniture WHERE user_id = ? AND municipality_id IS NULL ORDER BY id ASC`,
+          [targetId]
+        );
+      }
       return sendJson(res, 200, { ok: true, data: { placements: rows } });
     }
 
     // POST /api/game/user/room/furniture
-    // Item platzieren → in room_furniture speichern
     if (pathname === '/api/game/user/room/furniture' && req.method === 'POST') {
       ensureDbEnabled();
       const user = await getAuthenticatedUser(req);
@@ -49,15 +72,20 @@ module.exports = function registerRoomFurnitureRoutes(_deps) {
         return sendJson(res, 422, { ok: false, error: 'item_code, x, z erforderlich' });
       }
 
+      const municipalityId = await resolveMunicipalityId(
+        body.municipality_slug || null,
+        body.municipality_id || null
+      );
+
       const [result] = await dbPool.query(
-        `INSERT INTO room_furniture (user_id, item_code, x, z, floor_level, facing_idx, wy, pair_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [user.id, itemCode, x, z, floorLevel, facingIdx, wy, pairId]
+        `INSERT INTO room_furniture (user_id, municipality_id, item_code, x, z, floor_level, facing_idx, wy, pair_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [user.id, municipalityId || null, itemCode, x, z, floorLevel, facingIdx, wy, pairId]
       );
       return sendJson(res, 200, { ok: true, data: { id: result.insertId } });
     }
 
     // PATCH /api/game/user/room/furniture/:id
-    // Möbel verschieben/drehen (server-autoritativ, keine Duplikate)
     const patchMatch = pathname.match(/^\/api\/game\/user\/room\/furniture\/(\d+)$/)
     if (patchMatch && req.method === 'PATCH') {
       ensureDbEnabled();
@@ -89,7 +117,6 @@ module.exports = function registerRoomFurnitureRoutes(_deps) {
     }
 
     // DELETE /api/game/user/room/furniture/by-pos
-    // Fallback: Item nach Koordinaten löschen (wenn server_id noch nicht bekannt)
     if (pathname === '/api/game/user/room/furniture/by-pos' && req.method === 'DELETE') {
       ensureDbEnabled();
       const user = await getAuthenticatedUser(req);
@@ -104,18 +131,32 @@ module.exports = function registerRoomFurnitureRoutes(_deps) {
         return sendJson(res, 422, { ok: false, error: 'item_code, x, z erforderlich' });
       }
 
-      await dbPool.query(
-        `DELETE FROM room_furniture
-         WHERE user_id = ? AND item_code = ?
-           AND ABS(x - ?) < 0.1 AND ABS(z - ?) < 0.1
-         LIMIT 1`,
-        [user.id, itemCode, x, z]
+      const municipalityId = await resolveMunicipalityId(
+        body.municipality_slug || null,
+        body.municipality_id || null
       );
+
+      if (municipalityId) {
+        await dbPool.query(
+          `DELETE FROM room_furniture
+           WHERE user_id = ? AND municipality_id = ? AND item_code = ?
+             AND ABS(x - ?) < 0.1 AND ABS(z - ?) < 0.1
+           LIMIT 1`,
+          [user.id, municipalityId, itemCode, x, z]
+        );
+      } else {
+        await dbPool.query(
+          `DELETE FROM room_furniture
+           WHERE user_id = ? AND item_code = ?
+             AND ABS(x - ?) < 0.1 AND ABS(z - ?) < 0.1
+           LIMIT 1`,
+          [user.id, itemCode, x, z]
+        );
+      }
       return sendJson(res, 200, { ok: true });
     }
 
     // GET /api/game/user/room/furniture/teleport?furniture_id=X
-    // Verknüpftes Teleporter-Stück finden (gleiche pair_id, anderes Möbel-Element)
     if (pathname === '/api/game/user/room/furniture/teleport' && req.method === 'GET') {
       ensureDbEnabled();
       const params = new URL(requestUrl, 'http://x').searchParams;
@@ -136,7 +177,6 @@ module.exports = function registerRoomFurnitureRoutes(_deps) {
     }
 
     // DELETE /api/game/user/room/furniture/:id
-    // Platziertes Item entfernen
     const delMatch = pathname.match(/^\/api\/game\/user\/room\/furniture\/(\d+)$/)
     if (delMatch && req.method === 'DELETE') {
       ensureDbEnabled();

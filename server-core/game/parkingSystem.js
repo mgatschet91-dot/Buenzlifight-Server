@@ -222,87 +222,253 @@ async function runParkingExpiryTick(broadcastToRoom) {
   }
 }
 
-// ── Kontrolleur-Tick: Schwarzparker büssen (alle 30 s) ────────────────────────
+// ── Kontrolleur-NPC In-Memory-State ──────────────────────────────────────────
+// Map<roomKey, Map<npcId, NpcState>> — analog zu crimeRoomState in disasters.js
+const kontrolleurRoomState = new Map();
+// Pro Firma: wann war die letzte Patrouille (ms timestamp)
+const _companyLastPatrol = new Map();
+// Pro Firma: läuft gerade eine Patrouille?
+const _companyActiveNpc = new Map(); // companyId → npcId
+let _nextKontrolleurId = 1;
+
+// Patrouille alle 10 Minuten (± 2 Min Jitter damit nicht alle gleichzeitig)
+const PATROL_INTERVAL_MS = 10 * 60 * 1000;
+
+function _kontrolleurRoomKey(municipalityId, roomCode) {
+  return `${municipalityId}:${roomCode || 'MAIN'}`;
+}
+
+function _getKontrolleurMap(municipalityId, roomCode) {
+  const key = _kontrolleurRoomKey(municipalityId, roomCode);
+  if (!kontrolleurRoomState.has(key)) kontrolleurRoomState.set(key, new Map());
+  return kontrolleurRoomState.get(key);
+}
+
+// Alle aktiven Kontrolleur-NPCs einer Room als Array zurückgeben (für Broadcast)
+function getKontrolleurNpcStates(municipalityId, roomCode) {
+  const key = _kontrolleurRoomKey(municipalityId, roomCode);
+  const npcMap = kontrolleurRoomState.get(key);
+  if (!npcMap || npcMap.size === 0) return [];
+  return Array.from(npcMap.values()).map(n => ({
+    id: n.id, x: n.x, y: n.y, state: n.state,
+    targetX: n.targetX, targetY: n.targetY,
+    companyId: n.companyId,
+  }));
+}
+
+// ── Busse für einen einzelnen Kontrolleur-NPC ausstellen ─────────────────────
+async function _issueFineForNpc(npc, broadcastToRoom) {
+  const tileX = npc.targetX;
+  const tileY = npc.targetY;
+  const slot  = npc.targetSlot;
+
+  // Fahrzeug noch vorhanden?
+  const [[vehicle]] = await dbPool.query(
+    `SELECT color FROM parked_vehicles
+     WHERE municipality_id = ? AND tile_x = ? AND tile_y = ? AND slot = ? LIMIT 1`,
+    [npc.municipalityId, tileX, tileY, slot]
+  );
+  if (!vehicle) return; // Auto bereits weggefahren
+
+  // Spot noch gebührenpflichtig?
+  const [[cfg]] = await dbPool.query(
+    `SELECT is_free FROM parking_config WHERE municipality_id = ? AND tile_x = ? AND tile_y = ?`,
+    [npc.municipalityId, tileX, tileY]
+  );
+  if (!cfg || cfg.is_free) return; // Spot ist jetzt kostenlos
+
+  // Violation dynamisch anlegen (analog zu handleVehicleParked)
+  const [insResult] = await dbPool.query(
+    `INSERT IGNORE INTO parking_violations
+       (municipality_id, tile_x, tile_y, slot, fine_amount, status)
+     VALUES (?, ?, ?, ?, ?, 'unpaid')`,
+    [npc.municipalityId, tileX, tileY, slot, FINE_AMOUNT]
+  );
+  const violationId = insResult.insertId || null;
+
+  await dbPool.query(
+    `UPDATE parking_violations SET status = 'fined', security_company_id = ?, fined_at = NOW()
+     WHERE municipality_id = ? AND tile_x = ? AND tile_y = ? AND slot = ? AND status = 'unpaid'`,
+    [npc.companyId, npc.municipalityId, tileX, tileY, slot]
+  );
+  await dbPool.query(
+    `UPDATE municipality_stats SET treasury = treasury + ? WHERE municipality_id = ?`,
+    [FINE_COMMUNE, npc.municipalityId]
+  );
+  await dbPool.query(
+    `UPDATE companies SET balance = balance + ? WHERE id = ?`,
+    [FINE_COMPANY, npc.companyId]
+  );
+
+  const plate = vehicle.color ? _getPlate(tileX, tileY, slot, vehicle.color) : null;
+
+  await dbPool.query(
+    `INSERT INTO company_finances (company_id, amount, balance_after, reason, description)
+     VALUES (?, ?, (SELECT balance FROM companies WHERE id = ?), 'parking_fine_provision', ?)`,
+    [npc.companyId, FINE_COMPANY, npc.companyId, plate ? `🚗 ${plate}` : null]
+  );
+
+  await _ledger(npc.municipalityId, 'parking_fine', FINE_COMMUNE, {
+    violationId, tileX, tileY, slot,
+    companyId: npc.companyId, companyName: npc.companyName,
+    totalFine: FINE_AMOUNT, companyShare: FINE_COMPANY,
+  });
+
+  // XP und Busse-Zähler für den Kontrolleur-Bot
+  if (npc.botId) {
+    await dbPool.query(
+      `UPDATE npc_bots SET xp_earned = xp_earned + 5, contracts_completed = contracts_completed + 1 WHERE id = ?`,
+      [npc.botId]
+    ).catch(() => {});
+  }
+
+  // Fahrzeug nach Busse entfernen (fährt weg)
+  await dbPool.query(
+    `DELETE FROM parked_vehicles WHERE municipality_id = ? AND tile_x = ? AND tile_y = ? AND slot = ?`,
+    [npc.municipalityId, tileX, tileY, slot]
+  );
+
+  if (broadcastToRoom) {
+    broadcastToRoom(npc.municipalityId, 'vehicle-left-parking', { tileX, tileY, slot });
+    broadcastToRoom(npc.municipalityId, 'parking-fine-issued', {
+      tileX, tileY, slot,
+      fineAmount: FINE_AMOUNT, companyName: npc.companyName,
+      communeShare: FINE_COMMUNE, companyShare: FINE_COMPANY,
+    });
+  }
+}
+
+// ── Kontrolleur-NPC-Tick: Bewegung + Busse ausstellen (alle 3 s) ──────────────
+async function tickKontrolleurNpcs(broadcastToRoom) {
+  if (kontrolleurRoomState.size === 0) return;
+  try {
+    for (const [roomKey, npcMap] of kontrolleurRoomState) {
+      for (const [id, npc] of npcMap) {
+        if (npc.state === 'driving') {
+          // 1 Schritt pro Tick in Richtung Ziel (zuerst X, dann Y)
+          if (npc.x !== npc.targetX) {
+            npc.x += npc.x < npc.targetX ? 1 : -1;
+          } else if (npc.y !== npc.targetY) {
+            npc.y += npc.y < npc.targetY ? 1 : -1;
+          }
+          if (npc.x === npc.targetX && npc.y === npc.targetY) {
+            npc.state = 'inspecting';
+            npc.ticksInState = 0;
+          }
+        } else if (npc.state === 'inspecting') {
+          npc.ticksInState = (npc.ticksInState || 0) + 1;
+          if (npc.ticksInState >= 2) {
+            // Busse für aktuellen Spot ausstellen
+            try {
+              await _issueFineForNpc(npc, broadcastToRoom);
+            } catch (err) {
+              logError('PARKING', 'Kontrolleur-NPC Busse-Fehler', { error: err?.message, npcId: id });
+            }
+            // Nächsten Spot aus der Queue holen
+            const next = npc.pendingSpots && npc.pendingSpots.length > 0
+              ? npc.pendingSpots.shift()
+              : null;
+            if (next) {
+              npc.targetX = next.tileX;
+              npc.targetY = next.tileY;
+              npc.targetSlot = next.slot;
+              npc.state = 'driving';
+              npc.ticksInState = 0;
+            } else {
+              // Alle Spots abgearbeitet → Patrouille beendet
+              _companyActiveNpc.delete(npc.companyId);
+              npcMap.delete(id);
+            }
+          }
+        }
+      }
+      if (npcMap.size === 0) kontrolleurRoomState.delete(roomKey);
+    }
+  } catch (err) {
+    logError('PARKING', 'tickKontrolleurNpcs Fehler', { error: err?.message });
+  }
+}
+
+// ── Kontrolleur-Tick: Patrouille alle ~10 Minuten starten ────────────────────
 async function runParkingControlTick(broadcastToRoom) {
   ensureDbEnabled();
   try {
     const [firms] = await dbPool.query(
       `SELECT c.id AS company_id, c.municipality_id, c.name AS company_name,
-              COUNT(nb.id) AS kontrolleur_count
+              COALESCE(MAX(gr.room_code), 'MAIN') AS room_code
        FROM companies c
        JOIN company_types ct ON ct.id = c.company_type_id
-       JOIN npc_bots nb ON nb.company_id = c.id AND nb.bot_type = 'kontrolleur' AND nb.status != 'fired'
+       LEFT JOIN game_rooms gr ON gr.municipality_id = c.municipality_id AND gr.is_active = 1
        WHERE ct.code = 'parkraum_security' AND c.is_active = 1
+         AND EXISTS (SELECT 1 FROM npc_bots nb WHERE nb.company_id = c.id AND nb.bot_type = 'kontrolleur' AND nb.status != 'fired' AND nb.patrol_mode = 1)
        GROUP BY c.id`
     );
 
+    const now = Date.now();
+
     for (const firm of firms) {
-      const { company_id, municipality_id, company_name, kontrolleur_count } = firm;
-      const maxPerTick = kontrolleur_count * 2;
+      const { company_id, municipality_id, company_name, room_code } = firm;
 
-      const [violations] = await dbPool.query(
-        `SELECT pv.id, pv.tile_x, pv.tile_y, pv.slot, pv.fine_amount,
-                pveh.color AS vehicle_color
-         FROM parking_violations pv
-         LEFT JOIN parked_vehicles pveh
-           ON pveh.municipality_id = pv.municipality_id
-          AND pveh.tile_x = pv.tile_x AND pveh.tile_y = pv.tile_y AND pveh.slot = pv.slot
-         WHERE pv.municipality_id = ? AND pv.status = 'unpaid'
-         ORDER BY pv.created_at ASC LIMIT ?`,
-        [municipality_id, maxPerTick]
+      // Läuft gerade eine Patrouille für diese Firma? → überspringen
+      if (_companyActiveNpc.has(company_id)) continue;
+
+      // Intervall prüfen: zufälliger Jitter ±2 Min damit nicht alle gleichzeitig starten
+      const last = _companyLastPatrol.get(company_id) ?? 0;
+      const jitter = (Math.random() * 4 - 2) * 60 * 1000; // ±2 Min
+      if (now - last < PATROL_INTERVAL_MS + jitter) continue;
+
+      // Alle aktuell parkenden Fahrzeuge auf bezahlpflichtigen Spots laden
+      const [parkedOnPaid] = await dbPool.query(
+        `SELECT pv.tile_x, pv.tile_y, pv.slot
+         FROM parked_vehicles pv
+         JOIN parking_config pc
+           ON pc.municipality_id = pv.municipality_id
+          AND pc.tile_x = pv.tile_x AND pc.tile_y = pv.tile_y
+         WHERE pv.municipality_id = ? AND pc.is_free = 0
+         ORDER BY pv.tile_x, pv.tile_y, pv.slot`,
+        [municipality_id]
       );
 
-      if (violations.length === 0) continue;
-
-      // Batch: alle Verstösse auf einmal als 'fined' markieren
-      const ids = violations.map(v => v.id);
-      const placeholders = ids.map(() => '?').join(',');
-      await dbPool.query(
-        `UPDATE parking_violations SET status = 'fined', security_company_id = ?, fined_at = NOW() WHERE id IN (${placeholders})`,
-        [company_id, ...ids]
-      );
-
-      // Batch: Gemeindekasse einmal erhöhen (FINE_COMMUNE × Anzahl)
-      const totalCommune = FINE_COMMUNE * violations.length;
-      await dbPool.query(
-        `UPDATE municipality_stats SET treasury = treasury + ? WHERE municipality_id = ?`,
-        [totalCommune, municipality_id]
-      );
-
-      // Batch: Security-Firma einmal erhöhen
-      const totalCompany = FINE_COMPANY * violations.length;
-      await dbPool.query(`UPDATE companies SET balance = balance + ? WHERE id = ?`, [totalCompany, company_id]);
-
-      // Batch: company_finances-Einträge per Bulk-Insert (mit Kennzeichen als description)
-      const financeValues = violations.map(() => `(?, ?, (SELECT balance FROM companies WHERE id = ?), 'parking_fine_provision', ?)`).join(',');
-      const financeParams = violations.flatMap(v => {
-        const plate = v.vehicle_color ? _getPlate(v.tile_x, v.tile_y, v.slot, v.vehicle_color) : null;
-        return [company_id, FINE_COMPANY, company_id, plate ? `🚗 ${plate}` : null];
-      });
-      await dbPool.query(`INSERT INTO company_finances (company_id, amount, balance_after, reason, description) VALUES ${financeValues}`, financeParams);
-
-      // Ledger-Einträge (1 pro Verstoss für Nachvollziehbarkeit)
-      for (const v of violations) {
-        await _ledger(municipality_id, 'parking_fine', FINE_COMMUNE, {
-          violationId: v.id, tileX: v.tile_x, tileY: v.tile_y, slot: v.slot,
-          companyId: company_id, companyName: company_name,
-          totalFine: v.fine_amount, companyShare: FINE_COMPANY,
-        });
-
-        if (broadcastToRoom) {
-          broadcastToRoom(municipality_id, 'parking-fine-issued', {
-            tileX: v.tile_x, tileY: v.tile_y, slot: v.slot,
-            fineAmount: v.fine_amount, companyName: company_name,
-            communeShare: FINE_COMMUNE, companyShare: FINE_COMPANY,
-          });
-        }
+      if (parkedOnPaid.length === 0) {
+        // Kein Fahrzeug → Timer trotzdem setzen (sonst sofortiger Retry)
+        _companyLastPatrol.set(company_id, now);
+        continue;
       }
-    }
 
-    // Abgelaufene Verstösse entfernen (> 10 min, Auto längst weg)
-    await dbPool.query(
-      `DELETE FROM parking_violations WHERE status = 'unpaid' AND created_at < DATE_SUB(NOW(), INTERVAL 10 MINUTE)`
-    );
+      // Ersten Spot als Startziel, Rest in pendingSpots-Queue
+      const first = parkedOnPaid[0];
+      const pending = parkedOnPaid.slice(1).map(v => ({ tileX: v.tile_x, tileY: v.tile_y, slot: v.slot }));
+
+      // Bot-ID für XP-Vergabe holen
+      const [[botRow]] = await dbPool.query(
+        `SELECT id FROM npc_bots WHERE company_id = ? AND bot_type = 'kontrolleur' AND status != 'fired' AND patrol_mode = 1 LIMIT 1`,
+        [company_id]
+      );
+
+      // Spawn ~3-5 Tiles vom ersten Spot entfernt
+      const offsetX = (Math.random() < 0.5 ? 1 : -1) * (3 + Math.floor(Math.random() * 3));
+      const npcMap = _getKontrolleurMap(municipality_id, room_code);
+      const id = _nextKontrolleurId++;
+
+      npcMap.set(id, {
+        id,
+        botId: botRow?.id ?? null,
+        companyId: company_id,
+        companyName: company_name,
+        municipalityId: municipality_id,
+        x: Math.max(0, first.tile_x + offsetX),
+        y: first.tile_y,
+        targetX: first.tile_x,
+        targetY: first.tile_y,
+        targetSlot: first.slot,
+        pendingSpots: pending,
+        state: 'driving',
+        ticksInState: 0,
+      });
+
+      _companyActiveNpc.set(company_id, id);
+      _companyLastPatrol.set(company_id, now);
+    }
   } catch (err) {
     logError('PARKING', 'runParkingControlTick Fehler', { error: err?.message });
   }
@@ -440,6 +606,8 @@ module.exports = {
   handleVehicleLeft,
   runParkingExpiryTick,
   runParkingControlTick,
+  tickKontrolleurNpcs,
+  getKontrolleurNpcStates,
   setParkingConfig,
   getParkingConfigs,
   getParkingViolations,

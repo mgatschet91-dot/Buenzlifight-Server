@@ -6,7 +6,8 @@ const { sendJson } = require('../infra/http');
 const { applyCorsHeaders } = require('../infra/cors');
 const { logError } = require('../infra/logger');
 
-const BADGES_DIR = path.join(__dirname, '../public/badges');
+const BADGES_DIR  = path.join(__dirname, '../public/badges');
+const THUMBS_DIR  = path.join(__dirname, '../uploads/room-thumbs');
 
 const { processConstructionSyncAndBroadcast, wsPublishAuthoritativeStats } = require('./shared');
 
@@ -86,6 +87,21 @@ function createRequestHandler(deps) {
         res.writeHead(404);
         res.end();
         return;
+      }
+
+      // ── Raum-Thumbnails: /room-thumbs/{userId}.jpg ──────────────────
+      if (req.method === 'GET' && pathname.startsWith('/room-thumbs/')) {
+        const match = pathname.match(/^\/room-thumbs\/(\d+)\.jpg$/);
+        if (match) {
+          const filePath = path.join(THUMBS_DIR, `${match[1]}.jpg`);
+          if (fs.existsSync(filePath)) {
+            const data = fs.readFileSync(filePath);
+            res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'public, max-age=60', 'Content-Length': data.length });
+            res.end(data);
+            return;
+          }
+        }
+        res.writeHead(404); res.end(); return;
       }
 
       // ── robots.txt: Block all crawlers from indexing the API domain ──

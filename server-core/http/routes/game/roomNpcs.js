@@ -4,15 +4,26 @@ const { sendJson, readJsonBody } = require('../../../infra/http');
 const { dbPool, ensureDbEnabled } = require('../../../infra/db');
 const { getAuthenticatedUser } = require('../../../auth/middleware');
 
+async function resolveMunicipalityId(slug, directId) {
+  if (directId && Number(directId) > 0) return Number(directId);
+  if (!slug) return null;
+  const [rows] = await dbPool.query(
+    'SELECT id FROM municipalities WHERE slug = ? AND is_active = 1 LIMIT 1',
+    [String(slug)]
+  );
+  return rows[0] ? Number(rows[0].id) : null;
+}
+
 module.exports = function registerRoomNpcRoutes(_deps) {
   return async function handleRoomNpcs(req, res, pathname, requestUrl) {
 
-    // GET /api/game/user/room/npcs?user_id=X
-    // Alle platzierten NPCs eines Raums (public — für Besucher)
+    // GET /api/game/user/room/npcs?user_id=X&municipality_slug=xxx
     if (pathname === '/api/game/user/room/npcs' && req.method === 'GET') {
       ensureDbEnabled();
       const params = new URL(requestUrl, 'http://x').searchParams;
       const ownerId = parseInt(params.get('user_id') || '0', 10);
+      const municipalitySlug = params.get('municipality_slug') || '';
+      const municipalityIdParam = params.get('municipality_id') || '';
 
       let targetId = ownerId;
       if (!targetId) {
@@ -21,15 +32,26 @@ module.exports = function registerRoomNpcRoutes(_deps) {
         targetId = user.id;
       }
 
-      const [rows] = await dbPool.query(
-        `SELECT id, npc_name, npc_style, x, z, facing_idx, floor_level FROM room_npcs WHERE user_id = ? ORDER BY id ASC`,
-        [targetId]
-      );
+      const municipalityId = await resolveMunicipalityId(municipalitySlug, municipalityIdParam);
+
+      let rows;
+      if (municipalityId) {
+        [rows] = await dbPool.query(
+          `SELECT id, npc_name, npc_style, x, z, facing_idx, floor_level
+           FROM room_npcs WHERE user_id = ? AND municipality_id = ? ORDER BY id ASC`,
+          [targetId, municipalityId]
+        );
+      } else {
+        [rows] = await dbPool.query(
+          `SELECT id, npc_name, npc_style, x, z, facing_idx, floor_level
+           FROM room_npcs WHERE user_id = ? AND municipality_id IS NULL ORDER BY id ASC`,
+          [targetId]
+        );
+      }
       return sendJson(res, 200, { ok: true, data: { npcs: rows } });
     }
 
     // POST /api/game/user/room/npcs
-    // NPC platzieren (aus Inventar heraus)
     if (pathname === '/api/game/user/room/npcs' && req.method === 'POST') {
       ensureDbEnabled();
       const user = await getAuthenticatedUser(req);
@@ -47,16 +69,20 @@ module.exports = function registerRoomNpcRoutes(_deps) {
         return sendJson(res, 422, { ok: false, error: 'x, z erforderlich' });
       }
 
+      const municipalityId = await resolveMunicipalityId(
+        body.municipality_slug || null,
+        body.municipality_id || null
+      );
+
       const [result] = await dbPool.query(
-        `INSERT INTO room_npcs (user_id, npc_name, npc_style, x, z, facing_idx, floor_level)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [user.id, npcName, npcStyle, x, z, facingIdx, floorLevel]
+        `INSERT INTO room_npcs (user_id, municipality_id, npc_name, npc_style, x, z, facing_idx, floor_level)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [user.id, municipalityId || null, npcName, npcStyle, x, z, facingIdx, floorLevel]
       );
       return sendJson(res, 200, { ok: true, data: { id: result.insertId } });
     }
 
     // PATCH /api/game/user/room/npcs/:id
-    // NPC verschieben/drehen
     const patchMatch = pathname.match(/^\/api\/game\/user\/room\/npcs\/(\d+)$/);
     if (patchMatch && req.method === 'PATCH') {
       ensureDbEnabled();
@@ -86,7 +112,6 @@ module.exports = function registerRoomNpcRoutes(_deps) {
     }
 
     // DELETE /api/game/user/room/npcs/:id
-    // NPC entfernen → zurück ins Inventar
     const delMatch = pathname.match(/^\/api\/game\/user\/room\/npcs\/(\d+)$/);
     if (delMatch && req.method === 'DELETE') {
       ensureDbEnabled();

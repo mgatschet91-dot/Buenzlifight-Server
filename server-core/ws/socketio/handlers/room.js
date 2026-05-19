@@ -71,6 +71,7 @@ module.exports = function registerRoomHandlers(socket, io, context) {
       municipality = null;
     }
 
+    let room = null;
     if (municipality) {
       wsRoomMetadata.set(state.currentRoomKey, {
         municipalityId: Number(municipality.id),
@@ -82,7 +83,7 @@ module.exports = function registerRoomHandlers(socket, io, context) {
       await rooms.warmRoomRuntimeCache(municipality, roomCode, 'join-room');
 
       try {
-        const room = await rooms.getRoom(municipality.id, roomCode);
+        room = await rooms.getRoom(municipality.id, roomCode);
         const roomState = toJsonValue(room?.game_state);
         state.currentRoomIsPublic = Boolean(roomCode.startsWith('PUB') || roomState?.navigator_public === true);
       } catch {
@@ -154,7 +155,7 @@ module.exports = function registerRoomHandlers(socket, io, context) {
               const existing = avatarMap?.get(state.currentPlayerId);
               if (existing && existing.name !== authUser.nickname) {
                 existing.name = authUser.nickname;
-                io.to(state.currentRoomKey).emit('avatar-spawned', { ...existing, name: authUser.nickname });
+                socket.to(state.currentRoomKey).emit('avatar-spawned', { ...existing, name: authUser.nickname });
               }
             }
             helpers.wsRegisterUserSocket(state.currentUserId, socket.id, wsUserSockets);
@@ -231,6 +232,41 @@ module.exports = function registerRoomHandlers(socket, io, context) {
       } catch { /* non-critical */ }
     }
 
+    // Schloss-Check: Ist der Raum gesperrt? Eigentümer darf immer rein.
+    if (ownerUserId && state.currentUserId && ownerUserId !== state.currentUserId) {
+      // Whitelist-Check: wurde der Besucher vom Eigentümer eingelassen?
+      const { wsRoomWhitelist } = require('../../../ws/socketio/index');
+      const whitelist = wsRoomWhitelist.get(state.currentRoomKey);
+      const isWhitelisted = whitelist?.has(state.currentUserId) || false;
+      if (isWhitelisted) {
+        whitelist.delete(state.currentUserId); // einmalige Nutzung
+      } else {
+        try {
+          const { dbPool } = require('../../../infra/db');
+          const [[lockRow]] = await dbPool.query(
+            `SELECT is_locked, room_password_hash FROM user_room_settings WHERE user_id = ? LIMIT 1`,
+            [ownerUserId]
+          );
+          if (lockRow && lockRow.is_locked) {
+            if (lockRow.room_password_hash) {
+              const crypto = require('crypto');
+              const suppliedPw = String(data.roomPassword || data.room_password || '').slice(0, 100);
+              const suppliedHash = suppliedPw
+                ? crypto.createHash('sha256').update('meinort_room:' + suppliedPw).digest('hex')
+                : '';
+              if (suppliedHash !== lockRow.room_password_hash) {
+                socket.emit('room-locked', { needsPassword: true });
+                return;
+              }
+            } else {
+              socket.emit('room-locked', { needsPassword: false });
+              return;
+            }
+          }
+        } catch { /* non-critical */ }
+      }
+    }
+
     socket.join(state.currentRoomKey);
 
     // Global- und Kantonal-Chat Rooms beitreten (nur für authentifizierte User)
@@ -268,14 +304,16 @@ module.exports = function registerRoomHandlers(socket, io, context) {
     // Alle anderen Spieler im Raum bitten, ihre aktuelle Position sofort zu senden
     // (damit der neue Spieler die echte Position sieht, nicht die gespeicherte Destination)
     socket.to(state.currentRoomKey).emit('avatar-resync-request');
-    // Möbel-Snapshot beim Join senden (ownerUserId aus join-Daten oder Raummetadaten)
+    // Möbel-Snapshot beim Join senden — nach user_id UND municipality_id gefiltert
     const joinOwnerUserId = ownerUserId || wsRoomMetadata.get(state.currentRoomKey)?.ownerUserId || null;
-    if (joinOwnerUserId) {
+    const joinMunicipalityId = wsRoomMetadata.get(state.currentRoomKey)?.municipalityId || null;
+    if (joinOwnerUserId && joinMunicipalityId) {
       try {
         const { dbPool } = require('../../../infra/db');
         const [furnitureRows] = await dbPool.query(
-          `SELECT id, item_code, x, z, floor_level, facing_idx, wy FROM room_furniture WHERE user_id = ? ORDER BY id ASC`,
-          [joinOwnerUserId]
+          `SELECT id, item_code, x, z, floor_level, facing_idx, wy FROM room_furniture
+           WHERE user_id = ? AND municipality_id = ? ORDER BY id ASC`,
+          [joinOwnerUserId, joinMunicipalityId]
         );
         socket.emit('room-furniture-snapshot', { placements: furnitureRows, ownerUserId: joinOwnerUserId });
       } catch (_furErr) { /* non-critical */ }
@@ -324,6 +362,19 @@ module.exports = function registerRoomHandlers(socket, io, context) {
     if (municipality) {
       rooms.setRoomRuntimePlayers(municipality.id, roomCode, playerList.length);
       rooms.broadcastNavigatorRoomCount(io, roomCode, municipalitySlug, municipality.name, playerList.length);
+    }
+
+    // Besuch in user_room_visits speichern (fire-and-forget)
+    if (state.currentUserId && municipality) {
+      const { dbPool } = require('../../../infra/db');
+      const visitedRoomName = String(room?.city_name || municipality.name || '');
+      dbPool.query(
+        `INSERT INTO user_room_visits
+           (user_id, municipality_id, municipality_slug, municipality_name, room_code, room_name, visited_at)
+         VALUES (?, ?, ?, ?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE visited_at = NOW(), room_name = VALUES(room_name)`,
+        [state.currentUserId, municipality.id, municipality.slug, municipality.name, roomCode, visitedRoomName]
+      ).catch(() => {});
     }
   });
 
@@ -397,7 +448,9 @@ module.exports = function registerRoomHandlers(socket, io, context) {
     };
     if (!wsRoomAvatars.has(state.currentRoomKey)) wsRoomAvatars.set(state.currentRoomKey, new Map());
     wsRoomAvatars.get(state.currentRoomKey).set(state.currentPlayerId, avatar);
-    io.to(state.currentRoomKey).emit('avatar-spawned', avatar);
+    // socket.to() excludes sender — local player manages own charGroup client-side,
+    // receiving own avatar-spawned creates a duplicate remote avatar (Z-fighting)
+    socket.to(state.currentRoomKey).emit('avatar-spawned', avatar);
   });
 
   socket.on('avatar-move-request', (data = {}) => {
@@ -458,14 +511,16 @@ module.exports = function registerRoomHandlers(socket, io, context) {
     if (!state.currentRoomKey) return;
     const meta = wsRoomMetadata.get(state.currentRoomKey);
     const syncOwnerUserId = meta?.ownerUserId || null;
-    if (!syncOwnerUserId) return;
+    const syncMunicipalityId = meta?.municipalityId || null;
+    if (!syncOwnerUserId || !syncMunicipalityId) return;
     // Nur Nicht-ViewOnly darf einen Sync auslösen (= Eigentümer-Socket)
     if (state.isViewOnly) return;
     try {
       const { dbPool } = require('../../../infra/db');
       const [furnitureRows] = await dbPool.query(
-        `SELECT id, item_code, x, z, floor_level, facing_idx, wy FROM room_furniture WHERE user_id = ? ORDER BY id ASC`,
-        [syncOwnerUserId]
+        `SELECT id, item_code, x, z, floor_level, facing_idx, wy FROM room_furniture
+         WHERE user_id = ? AND municipality_id = ? ORDER BY id ASC`,
+        [syncOwnerUserId, syncMunicipalityId]
       );
       io.to(state.currentRoomKey).emit('room-furniture-snapshot', { placements: furnitureRows, ownerUserId: syncOwnerUserId });
     } catch { /* non-critical */ }
@@ -527,7 +582,7 @@ module.exports = function registerRoomHandlers(socket, io, context) {
       const { setParkingConfig } = require('../../../game/parkingSystem');
       await setParkingConfig(municipalityId, tileX, tileY, Boolean(isFree), rate);
       io.to(state.currentRoomKey).emit('parking-config-updated', { tileX, tileY, isFree: Boolean(isFree), feeRate: rate });
-    } catch(_e) { /* silent */ }
+    } catch(e) { logWarn('set-parking-config error:', e); }
   });
 
   socket.on('leave-parking', async (data = {}) => {
@@ -549,6 +604,74 @@ module.exports = function registerRoomHandlers(socket, io, context) {
       );
       io.to(state.currentRoomKey).emit('vehicle-left-parking', { tileX, tileY, slot });
     } catch(_e) { /* silent */ }
+  });
+
+  // ══════════════════════════════════════════════════════════════
+  // ANKLOPFEN (room-knock / room-knock-accept / room-knock-decline)
+  // ══════════════════════════════════════════════════════════════
+
+  // Besucher klopft an (wird an Eigentümer weitergeleitet)
+  socket.on('room-knock', (data = {}) => {
+    if (!state.currentUserId) return;
+    const ownerUserId = parseInt(data.ownerUserId, 10);
+    if (!ownerUserId || ownerUserId === state.currentUserId) return;
+
+    const { wsUserSockets } = require('../../../ws/socketio/index');
+    const ownerSockets = wsUserSockets.get(ownerUserId);
+    if (!ownerSockets) return;
+
+    for (const sid of ownerSockets) {
+      const ownerSock = io.sockets?.sockets?.get(sid);
+      if (ownerSock) {
+        ownerSock.emit('room-knock-received', {
+          fromUserId:   state.currentUserId,
+          fromNickname: String(data.fromNickname || `User #${state.currentUserId}`),
+        });
+      }
+    }
+  });
+
+  // Eigentümer lässt Besucher ein
+  socket.on('room-knock-accept', (data = {}) => {
+    if (!state.currentUserId) return;
+    const targetUserId = parseInt(data.targetUserId, 10);
+    if (!targetUserId) return;
+
+    const { wsRoomMetadata, wsRoomWhitelist, wsUserSockets } = require('../../../ws/socketio/index');
+
+    // Eigentümer-Raum finden
+    let ownerRoomKey = null;
+    for (const [rk, meta] of wsRoomMetadata.entries()) {
+      if (meta.ownerUserId === state.currentUserId) { ownerRoomKey = rk; break; }
+    }
+    if (!ownerRoomKey) return;
+
+    // Zur Whitelist hinzufügen
+    if (!wsRoomWhitelist.has(ownerRoomKey)) wsRoomWhitelist.set(ownerRoomKey, new Set());
+    wsRoomWhitelist.get(ownerRoomKey).add(targetUserId);
+
+    // Besucher benachrichtigen
+    const targetSockets = wsUserSockets.get(targetUserId);
+    if (targetSockets) {
+      for (const sid of targetSockets) {
+        io.sockets?.sockets?.get(sid)?.emit('room-knock-accepted');
+      }
+    }
+  });
+
+  // Eigentümer lehnt ab
+  socket.on('room-knock-decline', (data = {}) => {
+    if (!state.currentUserId) return;
+    const targetUserId = parseInt(data.targetUserId, 10);
+    if (!targetUserId) return;
+
+    const { wsUserSockets } = require('../../../ws/socketio/index');
+    const targetSockets = wsUserSockets.get(targetUserId);
+    if (targetSockets) {
+      for (const sid of targetSockets) {
+        io.sockets?.sockets?.get(sid)?.emit('room-knock-declined');
+      }
+    }
   });
 
   // ══════════════════════════════════════════════════════════════

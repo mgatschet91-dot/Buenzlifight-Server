@@ -77,6 +77,27 @@ function initSteam() {
   }
 }
 
+// ── Chromium Hit-Test-Koordinaten nach Resize/Start reparieren ───────────────
+// Electron/Windows-Bug: nach setContentSize oder beim ersten Laden stimmen die
+// Input-Koordinaten nicht mit dem visuellen Layout überein.
+// Fix: 1-px-Jiggle + sendInputEvent zwingt Chromium zur Neuberechnung.
+function _fixHitTest(win, delay = 120) {
+  setTimeout(() => {
+    if (!win || win.isDestroyed()) return;
+    const [w, h] = win.getContentSize();
+    win.setContentSize(w + 1, h);
+    win.setContentSize(w, h);
+    setTimeout(() => {
+      if (!win || win.isDestroyed()) return;
+      win.webContents.focus();
+      try {
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.floor(w / 2), y: Math.floor(h / 2) });
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: 0, y: 0 });
+      } catch {}
+    }, 50);
+  }, delay);
+}
+
 // ── Window ────────────────────────────────────────────────────────────────────
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -85,6 +106,7 @@ function createWindow() {
     minWidth: 1024,
     minHeight: 768,
     frame: false,
+    resizable: false,   // Kein natives Resize — verhindert die toten Ecken durch Windows-Resize-Handles
     backgroundColor: '#050b07',
     icon: path.join(__dirname, 'build', 'icon.ico'),
     webPreferences: {
@@ -109,6 +131,7 @@ function createWindow() {
     loadWithRetry(startUrl);
   }
 
+  mainWindow.webContents.on('did-finish-load', () => _fixHitTest(mainWindow, 300));
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
@@ -281,9 +304,11 @@ ipcMain.handle('steam:openInviteDialog', (_, connectStr) => {
 
 // ── IPC: Window ───────────────────────────────────────────────────────────────
 ipcMain.on('win:minimize', () => mainWindow?.minimize());
-ipcMain.on('win:maximize', () =>
-  mainWindow?.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize()
-);
+ipcMain.on('win:maximize', () => {
+  if (!mainWindow) return;
+  mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize();
+  _fixHitTest(mainWindow, 200);
+});
 ipcMain.on('win:close', () => mainWindow?.close());
 ipcMain.handle('win:setFullscreen', (_, flag) => { mainWindow?.setFullScreen(flag); });
 ipcMain.handle('win:isMaximized', () => mainWindow?.isMaximized() ?? false);
@@ -292,12 +317,9 @@ ipcMain.handle('win:setResolution', (_, width, height) => {
   if (!mainWindow) return;
   mainWindow.setContentSize(width, height);
   mainWindow.center();
-  // Chromium-Hitboxen nach Resize neu berechnen lassen
-  setTimeout(() => {
-    if (!mainWindow) return;
-    mainWindow.webContents.invalidate();
-    mainWindow.webContents.focus();
-  }, 80);
+  // Zweifach feuern: 150ms (schnell) + 500ms (nach vollständigem Layout-Reflow)
+  _fixHitTest(mainWindow, 150);
+  _fixHitTest(mainWindow, 500);
 });
 ipcMain.handle('win:getDisplays', () => {
   const { screen } = require('electron');

@@ -26,6 +26,10 @@ const wsRoomAuthoritativeStats = new Map();
 const wsRoomAvatars = new Map();
 const wsRoomMetadata = new Map();
 const wsUserSockets = new Map();
+// Map<roomKey, Set<userId>> — ephemeral mute list (RAM only, no DB)
+const wsRoomMuted = new Map();
+// Map<roomKey, Set<userId>> — einmalige Whitelist nach Anklopfen-Einlass
+const wsRoomWhitelist = new Map();
 
 function createSocketIOServer(httpServer) {
   const corsOrigin = CORS_ALLOW_ALL ? true : CORS_ALLOWED_ORIGINS;
@@ -118,6 +122,8 @@ module.exports = {
   createSocketIOServer,
   wsRoomPlayers,
   wsRoomAuthoritativeStats,
+  wsRoomMuted,
+  wsRoomWhitelist,
   wsRoomAvatars,
   wsRoomMetadata,
   wsUserSockets,

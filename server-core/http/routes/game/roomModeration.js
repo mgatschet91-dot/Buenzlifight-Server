@@ -65,6 +65,32 @@ module.exports = function registerRoomModerationRoutes(deps) {
       return sendJson(res, 200, { ok: true });
     }
 
+    // POST /api/game/user/room/mute  — Spieler stummschalten (nur RAM, kein DB)
+    if (pathname === '/api/game/user/room/mute' && req.method === 'POST') {
+      const owner = await getAuthenticatedUser(req);
+      if (!owner) return sendJson(res, 401, { ok: false, error: 'Nicht angemeldet' });
+
+      const body = await readJsonBody(req);
+      const targetUserId = parseInt(body.target_user_id, 10);
+      if (!targetUserId || targetUserId === owner.id) {
+        return sendJson(res, 422, { ok: false, error: 'Ungültige target_user_id' });
+      }
+
+      _muteUser(owner.id, targetUserId);
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // DELETE /api/game/user/room/mute/:targetUserId  — Stummschaltung aufheben
+    const unmuteMatch = pathname.match(/^\/api\/game\/user\/room\/mute\/(\d+)$/);
+    if (unmuteMatch && req.method === 'DELETE') {
+      const owner = await getAuthenticatedUser(req);
+      if (!owner) return sendJson(res, 401, { ok: false, error: 'Nicht angemeldet' });
+
+      const targetUserId = parseInt(unmuteMatch[1], 10);
+      _unmuteUser(owner.id, targetUserId);
+      return sendJson(res, 200, { ok: true });
+    }
+
     // GET /api/game/user/room/bans
     // Eigene Ban-Liste
     if (pathname === '/api/game/user/room/bans' && req.method === 'GET') {
@@ -84,6 +110,33 @@ module.exports = function registerRoomModerationRoutes(deps) {
     }
   };
 };
+
+// Hilfsfunktion: Spieler in Raum des Owners muten
+function _muteUser(ownerUserId, targetUserId) {
+  try {
+    const { wsRoomMetadata, wsRoomMuted } = require('../../../ws/socketio/index');
+    for (const [rk, meta] of wsRoomMetadata.entries()) {
+      if (meta.ownerUserId === ownerUserId) {
+        if (!wsRoomMuted.has(rk)) wsRoomMuted.set(rk, new Set());
+        wsRoomMuted.get(rk).add(targetUserId);
+        break;
+      }
+    }
+  } catch (_e) { /* non-critical */ }
+}
+
+// Hilfsfunktion: Stummschaltung aufheben
+function _unmuteUser(ownerUserId, targetUserId) {
+  try {
+    const { wsRoomMetadata, wsRoomMuted } = require('../../../ws/socketio/index');
+    for (const [rk, meta] of wsRoomMetadata.entries()) {
+      if (meta.ownerUserId === ownerUserId) {
+        wsRoomMuted.get(rk)?.delete(targetUserId);
+        break;
+      }
+    }
+  } catch (_e) { /* non-critical */ }
+}
 
 // Hilfsfunktion: Ziel-Socket finden + room-kicked senden + aus dem Raum entfernen
 function _kickUser(deps, ownerUserId, targetUserId, message) {

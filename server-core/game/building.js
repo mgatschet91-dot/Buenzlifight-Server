@@ -337,11 +337,17 @@ async function fetchItemDetails(tool, cantonCode = null) {
     return fallbackItemDetails[tool] || null;
   }
   let rows;
-  const cantonFilter = cantonCode ? ` AND (canton_code IS NULL OR canton_code = ${dbPool.escape(cantonCode)})` : '';
   try {
-    [rows] = await dbPool.query(
-      `SELECT ${colsFull} FROM game_item_details WHERE is_active = 1${cantonFilter} ORDER BY category ASC, tool ASC`
-    );
+    if (cantonCode) {
+      [rows] = await dbPool.query(
+        `SELECT ${colsFull} FROM game_item_details WHERE is_active = 1 AND (canton_code IS NULL OR canton_code = ?) ORDER BY category ASC, tool ASC`,
+        [cantonCode]
+      );
+    } else {
+      [rows] = await dbPool.query(
+        `SELECT ${colsFull} FROM game_item_details WHERE is_active = 1 ORDER BY category ASC, tool ASC`
+      );
+    }
   } catch (e) {
     [rows] = await dbPool.query(
       `SELECT ${colsSafe} FROM game_item_details WHERE is_active = 1 ORDER BY category ASC, tool ASC`

@@ -9,6 +9,7 @@ const { creditUserBankAccount } = require('../../../game/userBanking');
 const { createUserNotification } = require('../../../game/notifications');
 const { resolveBuenzliEvent } = require('../../../game/buenzli');
 const { calcCompanyLevel, calcWorkDuration, CONTRACT_WORKER_PAYOUT_SHARE } = require('./helpers');
+const { actionAttempts, ACTION_RATE_LIMIT, ACTION_WINDOW_MS, checkRateLimit, incrementRateLimit } = require('../../shared');
 
 module.exports = function registerContractRoutes(deps) {
   return async function handleContracts(req, res, pathname, requestUrl) {
@@ -51,6 +52,10 @@ module.exports = function registerContractRoutes(deps) {
       ensureDbEnabled();
       const authUser = await getAuthenticatedUser(req);
       if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const rlKey = `contract:${authUser.id}`;
+      const rlRetry = checkRateLimit(actionAttempts, rlKey, ACTION_RATE_LIMIT, ACTION_WINDOW_MS);
+      if (rlRetry > 0) return sendJson(res, 429, { ok: false, error: 'Zu viele Anfragen. Bitte warte kurz.' });
+      incrementRateLimit(actionAttempts, rlKey);
       const companyId = Number(contractAcceptMatch[1]);
       const contractId = Number(contractAcceptMatch[2]);
 
@@ -126,6 +131,10 @@ module.exports = function registerContractRoutes(deps) {
       ensureDbEnabled();
       const authUser = await getAuthenticatedUser(req);
       if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const rlKey = `contract:${authUser.id}`;
+      const rlRetry = checkRateLimit(actionAttempts, rlKey, ACTION_RATE_LIMIT, ACTION_WINDOW_MS);
+      if (rlRetry > 0) return sendJson(res, 429, { ok: false, error: 'Zu viele Anfragen. Bitte warte kurz.' });
+      incrementRateLimit(actionAttempts, rlKey);
       const companyId = Number(contractCompleteMatch[1]);
       const contractId = Number(contractCompleteMatch[2]);
 
@@ -318,8 +327,12 @@ module.exports = function registerContractRoutes(deps) {
       } catch (_) {}
 
       await dbPool.query(
-        `UPDATE company_members SET contracts_done = contracts_done + 1, xp_earned = xp_earned + ? WHERE company_id = ? AND user_id = ?`,
-        [contract.xp_reward || 0, companyId, authUser.id]
+        `UPDATE company_members
+         SET contracts_done = contracts_done + 1,
+             xp_earned = xp_earned + ?,
+             total_earnings = total_earnings + ?
+         WHERE company_id = ? AND user_id = ?`,
+        [contract.xp_reward || 0, workerPayment || 0, companyId, authUser.id]
       );
 
       const responseData = {

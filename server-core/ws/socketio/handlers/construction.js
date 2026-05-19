@@ -786,7 +786,7 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
   // Werkhof-LKW hat Gebäude repariert → Zustand auf 100% setzen
   // ══════════════════════════════════════════════════════════════
   socket.on('werkhof-repair-complete', async (data = {}) => {
-    if (!state.currentRoomKey) return;
+    if (!state.currentRoomKey || !state.currentUserId) return;
 
     const tileX = Number(data.x);
     const tileY = Number(data.y);

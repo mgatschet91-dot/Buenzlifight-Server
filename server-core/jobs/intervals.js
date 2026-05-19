@@ -254,6 +254,16 @@ function registerIntervals(deps) {
               logError('INTERVAL', `Buenzli NPC tick error for ${key}`, { error: buenzliErr?.message });
             }
 
+            // Kontrolleur-NPCs ticken + broadcasten
+            try {
+              const parkSys = getParkingSystem();
+              await parkSys.tickKontrolleurNpcs(buildBroadcastToRoom());
+              const kNpcs = parkSys.getKontrolleurNpcStates(municipalityId, roomCode);
+              io.to(roomKey).emit('kontrolleur-npc-authoritative', { npcs: kNpcs, serverTimestamp: Date.now() });
+            } catch (kErr) {
+              logError('INTERVAL', `Kontrolleur NPC tick error for ${key}`, { error: kErr?.message });
+            }
+
             // Party-Tick: Polizei-Warnungen + State-Broadcast
             try {
               await getPartyEvents().runPartyTick(roomKey, io, entry.roomCode);

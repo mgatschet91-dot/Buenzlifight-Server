@@ -144,7 +144,7 @@ async function listPublicNavigatorMaps(query = '', limit = 60) {
      INNER JOIN game_rooms r
        ON r.municipality_id = m.id
       AND r.is_active = 1
-      AND (r.room_code = 'MAIN' OR r.room_code LIKE 'PUB%')
+      AND r.room_code LIKE 'PUB%'
      LEFT JOIN users owner ON owner.id = (
        SELECT MIN(u2.id)
        FROM users u2
@@ -182,6 +182,71 @@ async function listPublicNavigatorMaps(query = '', limit = 60) {
   });
   enriched.sort((a, b) => Number(b.player_count || 0) - Number(a.player_count || 0));
   return enriched;
+}
+
+async function listPrivateHouses(query = '', limit = 60) {
+  ensureDbEnabled();
+  const { getRoomRuntimeEntry } = require('./rooms');
+  const q = String(query || '').trim().toLowerCase();
+  const safeLimit = Math.max(1, Math.min(200, Math.round(Number(limit || 60))));
+  const where = ['m.is_active = 1'];
+  const args = [];
+  if (q) {
+    where.push('(LOWER(m.name) LIKE ? OR LOWER(m.slug) LIKE ? OR LOWER(owner.nickname) LIKE ?)');
+    const eq = escapeLike(q);
+    args.push(`%${eq}%`, `%${eq}%`, `%${eq}%`);
+  }
+  args.push(safeLimit);
+
+  const [rows] = await dbPool.query(
+    `SELECT
+      m.id,
+      m.name,
+      m.slug,
+      m.canton_code,
+      m.canton_name,
+      COALESCE(r.room_code, 'MAIN') AS room_code,
+      COALESCE(r.city_name, m.name) AS room_name,
+      COALESCE(r.player_count, 0) AS player_count,
+      r.updated_at AS room_updated_at,
+      owner.id AS owner_id,
+      owner.nickname AS owner_nickname
+     FROM municipalities m
+     INNER JOIN game_rooms r
+       ON r.municipality_id = m.id
+      AND r.is_active = 1
+      AND r.room_code NOT LIKE 'PUB%'
+     LEFT JOIN users owner ON owner.id = (
+       SELECT MIN(u2.id)
+       FROM users u2
+       WHERE u2.municipality_id = m.id AND u2.is_active = 1
+     )
+     WHERE ${where.join(' AND ')}
+     ORDER BY COALESCE(r.player_count, 0) DESC, m.name ASC
+     LIMIT ?`,
+    args
+  );
+
+  const list = Array.isArray(rows) ? rows : [];
+  return list.map((row) => {
+    const runtimeEntry = getRoomRuntimeEntry(Number(row.id), 'MAIN', false);
+    const livePlayerCount = runtimeEntry ? Math.max(0, Number(runtimeEntry.activePlayers || 0)) : 0;
+    const effectivePlayerCount = Math.max(livePlayerCount, Number(row.player_count || 0));
+    return {
+      municipality_id: Number(row.id),
+      municipality_name: String(row.name || ''),
+      municipality_slug: String(row.slug || ''),
+      canton_code: row.canton_code || null,
+      canton_name: row.canton_name || null,
+      room_code: String(row.room_code || ''),
+      room_name: String(row.room_name || row.name || ''),
+      player_count: Math.max(0, effectivePlayerCount),
+      owner: row.owner_id
+        ? { id: Number(row.owner_id), nickname: row.owner_nickname || `User #${Number(row.owner_id)}` }
+        : null,
+      updated_at: row.room_updated_at || null,
+    };
+  });
 }
 
 async function getMunicipalityById(id) {
@@ -1208,6 +1273,7 @@ module.exports = {
   fetchCantonMunicipalities,
   searchMunicipalitiesForPartnerships,
   listPublicNavigatorMaps,
+  listPrivateHouses,
   getMunicipalityById,
   getMunicipalityBySlug,
   getMunicipalityOwner,

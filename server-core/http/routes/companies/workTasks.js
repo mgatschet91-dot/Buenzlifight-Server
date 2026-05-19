@@ -225,6 +225,43 @@ module.exports = function registerWorkTaskRoutes(deps) {
       }
     }
 
+    // POST /api/verwaltung/selbst-beheben-alle — Alle offenen Events direkt beheben (Gemeindekasse)
+    if (req.method === 'POST' && pathname === '/api/verwaltung/selbst-beheben-alle') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      if (!authUser.municipality_id) return sendJson(res, 400, { ok: false, error: 'Keine Gemeinde' });
+
+      const [memberRole] = await dbPool.query(
+        `SELECT role FROM municipality_memberships WHERE municipality_id = ? AND user_id = ?`,
+        [authUser.municipality_id, authUser.id]
+      );
+      if (!memberRole[0] || !['owner', 'admin', 'council'].includes(memberRole[0].role)) {
+        return sendJson(res, 403, { ok: false, error: 'Nur Verwaltung darf Events direkt beheben' });
+      }
+
+      const [openEvents] = await dbPool.query(
+        `SELECT me.id FROM municipality_events me WHERE me.municipality_id = ? AND me.status = 'reported' LIMIT 20`,
+        [authUser.municipality_id]
+      );
+
+      let resolved_count = 0;
+      let total_cost = 0;
+      const failed = [];
+
+      for (const ev of openEvents) {
+        try {
+          const result = await resolveBuenzliEvent(ev.id, authUser.id);
+          resolved_count++;
+          total_cost += result.cost || 0;
+        } catch {
+          failed.push(ev.id);
+        }
+      }
+
+      return sendJson(res, 200, { ok: true, data: { resolved_count, total_cost, failed } });
+    }
+
     // POST /api/verwaltung/notfallreparatur — Abgelaufenes Event nachträglich beheben (2x Kosten)
     if (req.method === 'POST' && pathname === '/api/verwaltung/notfallreparatur') {
       ensureDbEnabled();
@@ -701,7 +738,7 @@ module.exports = function registerWorkTaskRoutes(deps) {
       }
 
       const [statsRows] = await dbPool.query(
-        `SELECT cantonal_investigation_until, cantonal_investigation_stage, transparency
+        `SELECT cantonal_investigation_until, cantonal_investigation_stage
          FROM municipality_stats WHERE municipality_id = ?`,
         [authUser.municipality_id]
       );
@@ -713,10 +750,16 @@ module.exports = function registerWorkTaskRoutes(deps) {
       if (!isActive) {
         return sendJson(res, 400, { ok: false, error: 'Keine aktive kantonale Untersuchung' });
       }
-      if (stats.transparency < 30) {
+
+      const [[openEventsRow]] = await dbPool.query(
+        `SELECT COUNT(*) AS cnt FROM municipality_events
+         WHERE municipality_id = ? AND status = 'reported'`,
+        [authUser.municipality_id]
+      );
+      if ((openEventsRow?.cnt || 0) > 0) {
         return sendJson(res, 400, {
           ok: false,
-          error: `Transparenz zu niedrig (${stats.transparency}/100). Mindestens 30 Punkte erforderlich.`,
+          error: `Zuerst alle offenen Events beheben (${openEventsRow.cnt} offen).`,
         });
       }
 
@@ -740,9 +783,10 @@ module.exports = function registerWorkTaskRoutes(deps) {
         source: 'user',
       });
 
+      // Cooldown: until auf +24h setzen (stage=0), damit Pass 1 nicht sofort neu triggert
       await dbPool.query(
         `UPDATE municipality_stats
-         SET cantonal_investigation_until = NULL,
+         SET cantonal_investigation_until = DATE_ADD(NOW(), INTERVAL 24 HOUR),
              cantonal_investigation_since = NULL,
              cantonal_investigation_stage = 0,
              updated_at = NOW()
@@ -750,10 +794,17 @@ module.exports = function registerWorkTaskRoutes(deps) {
         [authUser.municipality_id]
       );
 
+      // Stat-Recovery: Beilegen gibt Transparenz + alle Stats einen Schub (je nach Stage)
+      const statBoost = stage * 10; // Stufe 1→+10, Stufe 2→+20, Stufe 3→+30
+      const { applyStatChange } = require('../../../game/buenzli.js');
+      for (const stat of ['transparency', 'security', 'attractiveness', 'cleanliness', 'infrastructure']) {
+        await applyStatChange(authUser.municipality_id, stat, statBoost, 'cantonal_settled', 'investigation', null);
+      }
+
       await createNotificationForAllMembers(authUser.municipality_id, {
         type: 'cantonal_investigation_resolved',
         title: 'Kantonale Untersuchung beigelegt',
-        message: `Die Untersuchung wurde offiziell beigelegt (CHF ${cost.toLocaleString('de-CH')} bezahlt).`,
+        message: `Die Untersuchung wurde offiziell beigelegt (CHF ${cost.toLocaleString('de-CH')} bezahlt). Alle Stats +${statBoost}. Schutzfrist: 24h.`,
         icon: 'checkmark',
         amount: -cost,
       });

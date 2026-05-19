@@ -254,6 +254,7 @@ module.exports = function registerManagementRoutes(deps) {
           contracts,
           applications,
           my_role: myRole,
+          my_user_id: authUser.id,
         },
       });
     }
@@ -373,15 +374,15 @@ module.exports = function registerManagementRoutes(deps) {
       );
       if (existingMember.length > 0) return sendJson(res, 400, { ok: false, error: 'User ist bereits Mitglied' });
 
-      // Max 2 Mitgliedschaften in fremden Firmen
-      const [foreignMemberships] = await dbPool.query(
+      // Max 3 Mitgliedschaften als Angestellter/Manager (nicht als Inhaber)
+      const [nonOwnerMemberships] = await dbPool.query(
         `SELECT COUNT(*) AS cnt FROM company_members cm
          JOIN companies c ON c.id = cm.company_id
-         WHERE cm.user_id = ? AND c.owner_id != ? AND c.is_active = 1`,
-        [targetUserId, targetUserId]
+         WHERE cm.user_id = ? AND cm.role != 'owner' AND c.is_active = 1`,
+        [targetUserId]
       );
-      if ((foreignMemberships[0]?.cnt || 0) >= 2) {
-        return sendJson(res, 400, { ok: false, error: `${targetUser[0].nickname} ist bereits in 2 fremden Firmen — das ist das Maximum.` });
+      if ((nonOwnerMemberships[0]?.cnt || 0) >= 3) {
+        return sendJson(res, 400, { ok: false, error: `${targetUser[0].nickname} ist bereits in 3 Firmen als Mitarbeiter/Manager — das ist das Maximum.` });
       }
 
       const [companyInfo] = await dbPool.query(
@@ -432,6 +433,13 @@ module.exports = function registerManagementRoutes(deps) {
       await dbPool.query(
         `DELETE FROM company_members WHERE company_id = ? AND user_id = ?`, [companyId, targetUserId]
       );
+
+      // Cooldown-Log: 'left' wenn selbst, 'kicked' wenn von Admin/Manager entfernt
+      const isKick = Number(authUser.id) !== targetUserId;
+      await dbPool.query(
+        `INSERT INTO company_member_log (company_id, user_id, reason) VALUES (?, ?, ?)`,
+        [companyId, targetUserId, isKick ? 'kicked' : 'left']
+      ).catch(() => {});
 
       return sendJson(res, 200, { ok: true, data: { removed: true, user_id: targetUserId } });
     }
@@ -518,7 +526,26 @@ module.exports = function registerManagementRoutes(deps) {
         `SELECT id, status FROM company_applications WHERE company_id = ? AND user_id = ? AND status = 'pending'`,
         [companyId, authUser.id]
       );
-      if (existingApp.length > 0) return sendJson(res, 400, { ok: false, error: 'Du hast bereits eine offene Bewerbung' });
+      if (existingApp.length > 0) return sendJson(res, 400, { ok: false, error: 'Du hast bereits eine offene Bewerbung bei dieser Firma' });
+
+      // 5-Tage-Cooldown nach Verlassen oder Kick
+      const [recentLog] = await dbPool.query(
+        `SELECT reason, removed_at FROM company_member_log
+         WHERE company_id = ? AND user_id = ? AND removed_at > NOW() - INTERVAL 5 DAY
+         ORDER BY removed_at DESC LIMIT 1`,
+        [companyId, authUser.id]
+      );
+      if (recentLog.length > 0) {
+        const entry = recentLog[0];
+        const removedAt = new Date(entry.removed_at);
+        const cooldownUntil = new Date(removedAt.getTime() + 5 * 24 * 60 * 60 * 1000);
+        const daysLeft = Math.ceil((cooldownUntil - new Date()) / (1000 * 60 * 60 * 24));
+        const reason = entry.reason === 'kicked' ? 'gekickt wurdest' : 'die Firma verlassen hast';
+        return sendJson(res, 400, {
+          ok: false,
+          error: `Du kannst dich erst wieder bewerben, weil du ${reason}. Noch ${daysLeft} Tag${daysLeft !== 1 ? 'e' : ''} Wartezeit.`,
+        });
+      }
 
       const body = await readJsonBody(req);
       const message = String(body.message || '').trim().substring(0, 500) || null;
@@ -574,15 +601,15 @@ module.exports = function registerManagementRoutes(deps) {
           return sendJson(res, 400, { ok: false, error: 'Firma ist voll — Bewerbung kann nicht angenommen werden' });
         }
 
-        // Max 2 Mitgliedschaften in fremden Firmen prüfen
-        const [foreignMemberships] = await dbPool.query(
+        // Max 3 Mitgliedschaften als Angestellter/Manager (nicht als Inhaber)
+        const [nonOwnerMemberships] = await dbPool.query(
           `SELECT COUNT(*) AS cnt FROM company_members cm
            JOIN companies c ON c.id = cm.company_id
-           WHERE cm.user_id = ? AND c.owner_id != ? AND c.is_active = 1`,
-          [application.user_id, application.user_id]
+           WHERE cm.user_id = ? AND cm.role != 'owner' AND c.is_active = 1`,
+          [application.user_id]
         );
-        if ((foreignMemberships[0]?.cnt || 0) >= 2) {
-          return sendJson(res, 400, { ok: false, error: 'Bewerber ist bereits in 2 fremden Firmen — Bewerbung kann nicht angenommen werden.' });
+        if ((nonOwnerMemberships[0]?.cnt || 0) >= 3) {
+          return sendJson(res, 400, { ok: false, error: 'Bewerber ist bereits in 3 Firmen als Mitarbeiter/Manager — Bewerbung kann nicht angenommen werden.' });
         }
 
         await dbPool.query(
@@ -609,6 +636,7 @@ module.exports = function registerManagementRoutes(deps) {
 
       let sql = `
         SELECT c.id, c.name, c.level, c.reputation, c.balance, c.total_revenue, ct.code AS type_code, ct.emoji,
+               (SELECT COUNT(*) FROM company_members cm WHERE cm.company_id = c.id) AS member_count,
                (SELECT COUNT(*) FROM bus_lines bl WHERE bl.company_id = c.id AND bl.status = 'active') AS active_line_count,
                (SELECT COUNT(*) FROM bus_line_stops bls JOIN bus_lines bl ON bl.id = bls.bus_line_id WHERE bl.company_id = c.id AND bl.status = 'active') AS active_stop_count
         FROM companies c

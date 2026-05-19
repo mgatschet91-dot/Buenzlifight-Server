@@ -56,15 +56,18 @@ const { createOrGetRoom, updateRoomState } = require('../../game/rooms');
 module.exports = function registerMunicipalityRoutes(deps) {
   return async function handleMunicipalities(req, res, pathname, requestUrl) {
 
-    // GET /api/municipalities/public — kein Auth erforderlich, für Steam-Onboarding
+    // GET /api/municipalities/public — kein Auth erforderlich, für Steam-Onboarding + Sitemap
     if (req.method === 'GET' && pathname === '/api/municipalities/public') {
       ensureDbEnabled();
+      const limitParam = requestUrl.searchParams.get('limit');
+      const limit = limitParam === 'all' ? null : Math.min(parseInt(limitParam || '50', 10) || 50, 5000);
       const [rows] = await dbPool.query(
-        `SELECT m.id, m.name, m.slug,
+        `SELECT m.id, m.name, m.slug, m.updated_at,
                 (SELECT COUNT(*) FROM municipality_memberships mm WHERE mm.municipality_id = m.id) AS member_count
          FROM municipalities m
          ORDER BY member_count DESC, m.name ASC
-         LIMIT 50`
+         ${limit !== null ? 'LIMIT ?' : ''}`,
+        limit !== null ? [limit] : []
       );
       return sendJson(res, 200, { ok: true, municipalities: rows, member_limit: MUNICIPALITY_MEMBER_LIMIT });
     }

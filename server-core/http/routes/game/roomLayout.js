@@ -1,12 +1,26 @@
 'use strict';
 // ─── Room Layout API ──────────────────────────────────────────────────────────
-// GET  /api/game/user/room/layout          → eigenes Layout laden (auth)
-// GET  /api/game/user/room/layout?user_id= → fremdes Layout laden (public)
-// PUT  /api/game/user/room/layout          → eigenes Layout speichern (auth, owner only)
+// GET  /api/game/user/room/layout            → eigenes Layout laden (auth)
+// GET  /api/game/user/room/layout?user_id=   → fremdes Layout laden (public)
+// PUT  /api/game/user/room/layout            → eigenes Layout speichern (auth, owner only)
+// PUT  /api/game/user/room/thumbnail         → Thumbnail speichern (auth, owner only)
+// GET  /api/game/pub-room/layout?slug&room_code → PUB-Room Layout laden
+// PUT  /api/game/pub-room/layout?slug&room_code → PUB-Room Layout speichern (admin/mod)
 
+const fs   = require('fs');
+const path = require('path');
 const { sendJson, readJsonBody } = require('../../../infra/http');
 const { dbPool, ensureDbEnabled } = require('../../../infra/db');
-const { getAuthenticatedUser } = require('../../../auth/middleware');
+const { getAuthenticatedUser, getUserGlobalRole } = require('../../../auth/middleware');
+const { GLOBAL_ROLE_MODERATOR, GLOBAL_ROLE_ADMINISTRATOR } = require('../../../config/constants');
+const { getMunicipalityBySlug } = require('../../../game/municipality');
+const crypto = require('crypto');
+
+const THUMBS_DIR = path.join(__dirname, '../../../uploads/room-thumbs');
+
+function hashRoomPassword(plaintext) {
+  return crypto.createHash('sha256').update('meinort_room:' + plaintext).digest('hex');
+}
 
 // ── Hilfsfunktion: Layout aus DB für einen User laden ─────────────────────────
 async function loadLayoutForUser(userId) {
@@ -50,10 +64,18 @@ async function loadLayoutForUser(userId) {
 
   // Spawn
   const [spawnRows] = await dbPool.query(
-    `SELECT spawn_x, spawn_z, floor_idx FROM user_room_spawn WHERE user_id = ? LIMIT 1`,
+    `SELECT spawn_x, spawn_z, floor_idx, facing_idx FROM user_room_spawn WHERE user_id = ? LIMIT 1`,
     [userId]
   );
-  const spawnRow = spawnRows[0] || { spawn_x: 0, spawn_z: 0, floor_idx: 0 };
+  const spawnRow = spawnRows[0] || { spawn_x: 0, spawn_z: 0, floor_idx: 0, facing_idx: 0 };
+
+  // Raum-Einstellungen (Wandfarbe, Beleuchtung, Name, Kapazität, Schloss)
+  const [[settingsRow]] = await dbPool.query(
+    `SELECT wall_color_hex, lighting_json, room_display_name, room_description, max_visitors,
+            is_locked, room_password_hash
+     FROM user_room_settings WHERE user_id = ? LIMIT 1`,
+    [userId]
+  );
 
   // Löcher den Etagen zuordnen
   const holesById = {};
@@ -132,14 +154,22 @@ async function loadLayoutForUser(userId) {
 
   return {
     v: 1,
+    wallColor:        settingsRow?.wall_color_hex ?? '#d8c9a8',
+    lighting:         settingsRow?.lighting_json ? (() => { try { return JSON.parse(settingsRow.lighting_json); } catch { return null; } })() : null,
+    roomDisplayName:  settingsRow?.room_display_name ?? null,
+    roomDescription:  settingsRow?.room_description  ?? null,
+    maxVisitors:      settingsRow?.max_visitors       ?? 25,
+    isLocked:         settingsRow?.is_locked          ? true : false,
+    hasPassword:      settingsRow?.room_password_hash ? true : false,
     floors,
     stairs,
     rollers,
     spawn: {
-      x:        spawnRow.spawn_x,
-      z:        spawnRow.spawn_z,
-      floorId:  'f' + spawnRow.floor_idx,
-      floor_idx: spawnRow.floor_idx,
+      x:          spawnRow.spawn_x,
+      z:          spawnRow.spawn_z,
+      floorId:    'f' + spawnRow.floor_idx,
+      floor_idx:  spawnRow.floor_idx,
+      facing_idx: spawnRow.facing_idx ?? 0,
     },
   };
 }
@@ -364,7 +394,9 @@ module.exports = function registerRoomLayoutRoutes(_deps) {
       if (err) return sendJson(res, 422, { ok: false, error: err });
 
       const userId = user.id;
-      const { floors, stairs = [], rollers = [], spawn } = body;
+      const { floors, stairs = [], rollers = [], spawn, wallColor, lighting,
+              roomDisplayName, roomDescription, maxVisitors,
+              isLocked, roomPassword } = body;
 
       // Atomar: alles löschen → neu einfügen
       const conn = await dbPool.getConnection();
@@ -448,11 +480,12 @@ module.exports = function registerRoomLayoutRoutes(_deps) {
 
         // 6. Spawn speichern
         if (spawn) {
-          const floorIdx = spawn.floor_idx != null ? spawn.floor_idx : (parseInt((spawn.floorId || '0').replace(/\D/g, ''), 10) || 0);
+          const floorIdx  = spawn.floor_idx != null ? spawn.floor_idx : (parseInt((spawn.floorId || '0').replace(/\D/g, ''), 10) || 0);
+          const facingIdx = Math.max(0, Math.min(3, parseInt(spawn.facing_idx ?? 0, 10)));
           await conn.query(
-            `INSERT INTO user_room_spawn (user_id, spawn_x, spawn_z, floor_idx)
-             VALUES (?,?,?,?)`,
-            [userId, spawn.x ?? 0, spawn.z ?? 0, floorIdx]
+            `INSERT INTO user_room_spawn (user_id, spawn_x, spawn_z, floor_idx, facing_idx)
+             VALUES (?,?,?,?,?)`,
+            [userId, spawn.x ?? 0, spawn.z ?? 0, floorIdx, facingIdx]
           );
         }
 
@@ -464,7 +497,140 @@ module.exports = function registerRoomLayoutRoutes(_deps) {
         conn.release();
       }
 
+      // Raum-Einstellungen speichern (Wandfarbe, Beleuchtung, Name, Beschreibung, Kapazität, Schloss)
+      const safeWallColor  = /^#[0-9a-fA-F]{6}$/.test(wallColor) ? wallColor : '#d8c9a8';
+      const lightingJson   = lighting && typeof lighting === 'object' ? JSON.stringify(lighting) : null;
+      const safeRoomName   = roomDisplayName ? String(roomDisplayName).trim().slice(0, 60)   || null : null;
+      const safeRoomDesc   = roomDescription ? String(roomDescription).trim().slice(0, 200)  || null : null;
+      const safeMaxVisit   = Math.min(50, Math.max(5, Number(maxVisitors) || 25));
+      const safeLocked     = isLocked ? 1 : 0;
+      // roomPassword: leer → Passwort entfernen; gesetzt → hashen und speichern
+      // null → unveränderter Passwort-Hash (nicht mitgeschickt)
+      let passwordHash;
+      if (roomPassword === '') {
+        passwordHash = null; // Passwort entfernen
+      } else if (roomPassword && typeof roomPassword === 'string') {
+        passwordHash = hashRoomPassword(roomPassword.slice(0, 100));
+      } else {
+        // Feld nicht mitgeschickt → bestehenden Hash behalten
+        const [[curSettings]] = await dbPool.query(
+          'SELECT room_password_hash FROM user_room_settings WHERE user_id = ? LIMIT 1',
+          [userId]
+        );
+        passwordHash = curSettings?.room_password_hash ?? null;
+      }
+      await dbPool.query(
+        `INSERT INTO user_room_settings
+           (user_id, wall_color_hex, lighting_json, room_display_name, room_description, max_visitors, is_locked, room_password_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           wall_color_hex     = VALUES(wall_color_hex),
+           lighting_json      = VALUES(lighting_json),
+           room_display_name  = VALUES(room_display_name),
+           room_description   = VALUES(room_description),
+           max_visitors       = VALUES(max_visitors),
+           is_locked          = VALUES(is_locked),
+           room_password_hash = VALUES(room_password_hash)`,
+        [userId, safeWallColor, lightingJson, safeRoomName, safeRoomDesc, safeMaxVisit, safeLocked, passwordHash]
+      );
+
       return sendJson(res, 200, { ok: true });
+    }
+
+    // ── GET /api/game/pub-room/layout?slug=...&room_code=... ───────────────
+    if (pathname === '/api/game/pub-room/layout' && req.method === 'GET') {
+      ensureDbEnabled();
+      const url      = new URL('http://x' + req.url);
+      const slug     = (url.searchParams.get('slug') || '').trim();
+      const roomCode = (url.searchParams.get('room_code') || '').trim().toUpperCase();
+      if (!slug || !roomCode) return sendJson(res, 400, { ok: false, error: 'slug und room_code erforderlich' });
+
+      const muni = await getMunicipalityBySlug(slug);
+      if (!muni) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      const [[row]] = await dbPool.query(
+        'SELECT layout_json FROM game_rooms WHERE municipality_id = ? AND room_code = ? LIMIT 1',
+        [muni.id, roomCode]
+      );
+      if (!row) return sendJson(res, 404, { ok: false, error: 'Raum nicht gefunden' });
+
+      // Kein gespeichertes Layout → einfaches Erdgeschoss als Fallback
+      if (!row.layout_json) {
+        const defaultLayout = {
+          v: 1,
+          floors: [{ id: 'f0', floor_index: 0, name: 'Erdgeschoss', y: 0, x0: -12, x1: 12, z0: -12, z1: 12, colorA: 0x5a8a7a, colorB: 0x4a7a6a, wallN: false, wallS: false, wallE: false, wallW: false, doorN: false, doorS: false, doorE: false, doorW: false, holes: [] }],
+          stairs: [],
+          rollers: [],
+          spawn: { x: 0, z: 0, floorId: 'f0', floor_idx: 0, facing_idx: 0 },
+        };
+        return sendJson(res, 200, { ok: true, data: defaultLayout });
+      }
+
+      let layout;
+      try { layout = JSON.parse(row.layout_json); } catch { return sendJson(res, 500, { ok: false, error: 'Gespeichertes Layout ist ungültig' }); }
+      return sendJson(res, 200, { ok: true, data: layout });
+    }
+
+    // ── PUT /api/game/pub-room/layout?slug=...&room_code=... ──────────────
+    if (pathname === '/api/game/pub-room/layout' && req.method === 'PUT') {
+      ensureDbEnabled();
+      const user = await getAuthenticatedUser(req);
+      if (!user) return sendJson(res, 401, { ok: false, error: 'Nicht angemeldet' });
+
+      const globalRole = await getUserGlobalRole(user.id);
+      const role = String(globalRole || '').toLowerCase();
+      if (role !== GLOBAL_ROLE_MODERATOR && role !== GLOBAL_ROLE_ADMINISTRATOR) {
+        return sendJson(res, 403, { ok: false, error: 'Nur Moderatoren und Admins dürfen öffentliche Räume bearbeiten' });
+      }
+
+      const url      = new URL('http://x' + req.url);
+      const slug     = (url.searchParams.get('slug') || '').trim();
+      const roomCode = (url.searchParams.get('room_code') || '').trim().toUpperCase();
+      if (!slug || !roomCode) return sendJson(res, 400, { ok: false, error: 'slug und room_code erforderlich' });
+
+      const muni = await getMunicipalityBySlug(slug);
+      if (!muni) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      const body = await readJsonBody(req);
+      const err  = validateLayout(body);
+      if (err) return sendJson(res, 422, { ok: false, error: err });
+
+      const [result] = await dbPool.query(
+        'UPDATE game_rooms SET layout_json = ? WHERE municipality_id = ? AND room_code = ?',
+        [JSON.stringify(body), muni.id, roomCode]
+      );
+      if (result.affectedRows === 0) return sendJson(res, 404, { ok: false, error: 'Raum nicht gefunden' });
+
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // ── PUT /api/game/user/room/thumbnail ───────────────────────────────────
+    if (pathname === '/api/game/user/room/thumbnail' && req.method === 'PUT') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+
+      const body = await readJsonBody(req);
+      const dataUrl = String(body?.dataUrl || '');
+      const match = dataUrl.match(/^data:image\/(jpeg|jpg|png|webp);base64,(.+)$/);
+      if (!match) return sendJson(res, 400, { ok: false, error: 'Ungültige dataUrl' });
+
+      const imageBuffer = Buffer.from(match[2], 'base64');
+      if (imageBuffer.length > 500 * 1024) {
+        return sendJson(res, 413, { ok: false, error: 'Thumbnail zu groß (max. 500 KB)' });
+      }
+
+      if (!fs.existsSync(THUMBS_DIR)) fs.mkdirSync(THUMBS_DIR, { recursive: true });
+      fs.writeFileSync(path.join(THUMBS_DIR, `${authUser.id}.jpg`), imageBuffer);
+
+      await dbPool.query(
+        `INSERT INTO user_room_settings (user_id, thumbnail_updated_at)
+         VALUES (?, NOW())
+         ON DUPLICATE KEY UPDATE thumbnail_updated_at = NOW()`,
+        [authUser.id]
+      );
+
+      return sendJson(res, 200, { ok: true, url: `/room-thumbs/${authUser.id}.jpg` });
     }
   };
 };
