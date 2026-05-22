@@ -145,9 +145,13 @@ async function respondToLoanRequest(requestId, responderId, decision, rejectReas
     if (decision === 'approved') {
       // ── GENEHMIGUNG ──
 
-      // a) Geld aus Gemeindekasse abziehen (über applyMunicipalityTransaction)
-      //    Wir machen das ausserhalb der Conn, da applyMunicipalityTransaction eigene Connection nutzt
-      await conn.rollback(); // Rollback temporär, wir machen es anders
+      // a) Status sofort auf 'approved' setzen und committen, bevor der FOR UPDATE Lock freigegeben wird.
+      //    Damit können keine zwei parallelen Genehmigungen dieselbe Anfrage doppelt verarbeiten.
+      await conn.query(
+        `UPDATE company_loan_requests SET status = 'approved', responded_by = ?, responded_at = NOW() WHERE id = ?`,
+        [responderId, requestId]
+      );
+      await conn.commit();
 
       // Treasury prüfen
       const [statsCheck] = await dbPool.query(
@@ -211,12 +215,10 @@ async function respondToLoanRequest(requestId, responderId, decision, rejectReas
          request.interest_rate, request.weekly_repayment]
       );
 
-      // g) Request aktualisieren
+      // g) Request mit company_id ergänzen (status/responded_by bereits oben gesetzt)
       await dbPool.query(
-        `UPDATE company_loan_requests
-         SET status = 'approved', responded_by = ?, responded_at = NOW(), company_id = ?, updated_at = NOW()
-         WHERE id = ?`,
-        [responderId, companyId, requestId]
+        `UPDATE company_loan_requests SET company_id = ?, updated_at = NOW() WHERE id = ?`,
+        [companyId, requestId]
       );
 
       // h) Badge

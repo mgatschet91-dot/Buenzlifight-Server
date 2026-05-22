@@ -635,7 +635,7 @@ module.exports = function registerManagementRoutes(deps) {
       const municipalityId = munRows[0].id;
 
       let sql = `
-        SELECT c.id, c.name, c.level, c.reputation, c.balance, c.total_revenue, ct.code AS type_code, ct.emoji,
+        SELECT c.id, c.name, c.level, c.reputation, ct.code AS type_code, ct.emoji,
                (SELECT COUNT(*) FROM company_members cm WHERE cm.company_id = c.id) AS member_count,
                (SELECT COUNT(*) FROM bus_lines bl WHERE bl.company_id = c.id AND bl.status = 'active') AS active_line_count,
                (SELECT COUNT(*) FROM bus_line_stops bls JOIN bus_lines bl ON bl.id = bls.bus_line_id WHERE bl.company_id = c.id AND bl.status = 'active') AS active_stop_count

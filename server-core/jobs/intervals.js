@@ -32,6 +32,7 @@ function registerIntervals(deps) {
   const getDisasters = () => require('../game/disasters');
   const getStats = () => require('../game/stats');
   const getBuenzli = () => require('../game/buenzli');
+  const getCitizens = () => require('../game/citizens');
   const getBank = () => require('../game/bank');
   const getCompanyLoans = () => require('../game/companyLoans');
   const getMansionRentals = () => require('../game/mansionRentals');
@@ -264,6 +265,20 @@ function registerIntervals(deps) {
               logError('INTERVAL', `Kontrolleur NPC tick error for ${key}`, { error: kErr?.message });
             }
 
+            // Citizens-authoritative: aktive Pendler broadcasten (tageszeit-abhängig)
+            try {
+              const hour = new Date().getHours();
+              const activeCitizens = await getCitizens().getActiveCitizensForBroadcast(municipalityId, hour);
+              if (activeCitizens.length > 0) {
+                io.to(roomKey).emit('citizens-authoritative', {
+                  citizens: activeCitizens,
+                  serverTimestamp: Date.now(),
+                });
+              }
+            } catch (citErr) {
+              logError('INTERVAL', `Citizens tick error for ${key}`, { error: citErr?.message });
+            }
+
             // Party-Tick: Polizei-Warnungen + State-Broadcast
             try {
               await getPartyEvents().runPartyTick(roomKey, io, entry.roomCode);
@@ -318,6 +333,32 @@ function registerIntervals(deps) {
       logError('INTERVAL', 'Stats/disaster tick error', { error: err?.message });
     }
   }, 3000));
+
+  // 4a) Citizen happiness + migration tick (every 5 minutes)
+  // Backfill wird einmalig pro Gemeinde pro Server-Session ausgeführt
+  const _citizenBackfilledMunicipalities = new Set();
+  intervals.push(setInterval(async () => {
+    try {
+      const rooms = getRooms();
+      const citizens = getCitizens();
+      for (const [, entry] of rooms.roomRuntimeCache.entries()) {
+        if (entry.activePlayers <= 0) continue;
+        const municipalityId = entry.municipalityId;
+
+        // Einmaligen Backfill für neue/bestehende Gebäude ohne Bewohner
+        if (!_citizenBackfilledMunicipalities.has(municipalityId)) {
+          _citizenBackfilledMunicipalities.add(municipalityId);
+          citizens.backfillCitizensForAllBuildings(municipalityId).catch(() => {});
+        }
+
+        const crimeRate = Math.min(1, (entry._lastCrimeCount || 0) / 10);
+        await citizens.runCitizenHappinessTick(municipalityId, crimeRate).catch(() => {});
+        await citizens.runCitizenMigrationCheck(municipalityId).catch(() => {});
+      }
+    } catch (err) {
+      logError('INTERVAL', 'Citizen happiness tick error', { error: err?.message });
+    }
+  }, 5 * 60 * 1000));
 
   // 4) Buenzli event tick (every 60s)
   intervals.push(setInterval(async () => {

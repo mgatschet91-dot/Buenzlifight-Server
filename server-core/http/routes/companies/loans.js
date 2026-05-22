@@ -161,6 +161,12 @@ module.exports = function registerLoanRoutes(/* deps */) {
       const companyId = Number(companyLoanMatch[1]);
 
       try {
+        const [membership] = await dbPool.query(
+          `SELECT role FROM company_members WHERE company_id = ? AND user_id = ? LIMIT 1`,
+          [companyId, authUser.id]
+        );
+        if (!membership.length) return sendJson(res, 403, { ok: false, error: 'Kein Zugriff auf diese Firma' });
+
         const loan = await getCompanyLoan(companyId);
         return sendJson(res, 200, { ok: true, data: { loan } });
       } catch (err) {

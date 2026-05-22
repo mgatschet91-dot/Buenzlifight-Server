@@ -218,9 +218,20 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
       if (typeof ack === 'function') ack({ success: false, error: 'not_authenticated' });
       return;
     }
-    if (!canBuildInMunicipality(state.socketMunicipalityRole)) {
-      if (typeof ack === 'function') ack({ success: false, error: 'no_permission' });
-      return;
+    // Live-DB-Check wie bei upgrade-building (verhindert Nutzung nach Rollen-Entzug)
+    try {
+      const { getUserMunicipalityRole } = require('../../../game/municipality');
+      const liveRole = await getUserMunicipalityRole(state.currentUserId, state.socketMunicipalityId);
+      state.socketMunicipalityRole = liveRole;
+      if (!canBuildInMunicipality(liveRole)) {
+        if (typeof ack === 'function') ack({ success: false, error: 'no_permission' });
+        return;
+      }
+    } catch {
+      if (!canBuildInMunicipality(state.socketMunicipalityRole)) {
+        if (typeof ack === 'function') ack({ success: false, error: 'no_permission' });
+        return;
+      }
     }
     const tileX = Number(data.x);
     const tileY = Number(data.y);
@@ -405,8 +416,8 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
 
       const item = items[0];
 
-      // Citizens dürfen nur ihre eigene Mansion verschieben (andere Gebäude sind Community-Gebäude)
-      if (isCitizen && item.tool === 'mansion' && item.user_id && Number(item.user_id) !== Number(state.currentUserId)) {
+      // Citizens dürfen keine Gebäude verschieben, die einem anderen User gehören
+      if (isCitizen && item.user_id && Number(item.user_id) !== Number(state.currentUserId)) {
         if (typeof ack === 'function') ack({ success: false, error: 'not_your_building' });
         return;
       }
@@ -479,9 +490,9 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
       }
 
       // Metadata updaten (flipped) + Position
+      // Level kommt ausschliesslich aus der DB (meta), nie vom Client
       const incomingBuildingType = String(data.buildingType || item.tool || '');
-      const incomingLevel = Number(data.level ?? meta.level ?? 1);
-      const newMeta = { ...meta, flipped, level: incomingLevel };
+      const newMeta = { ...meta, flipped };
       await dbPool.query(
         `UPDATE game_items SET x = ?, y = ?, metadata = ?, version = version + 1
          WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ? AND action_type = 'place'`,
@@ -576,8 +587,7 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
         return;
       }
 
-      // Deduct money
-      await getRooms.deductMunicipalityMoney(roomMeta.municipalityId, EXPAND_COST);
+      // Deduct money + log transaction (applyMunicipalityTransaction handles both)
       const { applyMunicipalityTransaction } = require('../../../game/bank');
       const expandBankResult = await applyMunicipalityTransaction(roomMeta.municipalityId, {
         amount: -EXPAND_COST,
@@ -787,6 +797,7 @@ module.exports = function registerConstructionHandlers(socket, io, context) {
   // ══════════════════════════════════════════════════════════════
   socket.on('werkhof-repair-complete', async (data = {}) => {
     if (!state.currentRoomKey || !state.currentUserId) return;
+    if (!canBuildInMunicipality(state.socketMunicipalityRole)) return;
 
     const tileX = Number(data.x);
     const tileY = Number(data.y);

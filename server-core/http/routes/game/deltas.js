@@ -42,6 +42,7 @@ const {
 } = require('../../../game/disasters');
 
 const { applyMunicipalityTransaction } = require('../../../game/bank');
+const { generateCitizensForBuilding, assignJobsToCitizens } = require('../../../game/citizens');
 
 const {
   toFiniteNumber,
@@ -99,6 +100,8 @@ module.exports = function registerDeltasRoutes(deps) {
       let version = await getRoomItemVersion(municipality.id, roomCode);
       let applied = 0;
       const placedBuildingsMeta = []; // { tool, cost } pro platziertem Gebäude für Ledger-Meta
+      const newResidentialBuildings = []; // { buildingId, tool, maxPop } für Citizen-Generierung
+      let needsJobAssignment = false;    // true wenn neue Gewerbe/Industrie-Gebäude platziert wurden
       const assignedZoneBuildings = []; // für sofortiges buildings-authoritative nach Zone-Platzierung
       const now = new Date();
       const mapMeta = await getGameMapForMunicipality(municipality.id);
@@ -134,6 +137,7 @@ module.exports = function registerDeltasRoutes(deps) {
         let persistedMetadata = delta.metadata && typeof delta.metadata === 'object'
           ? { ...delta.metadata }
           : null;
+        let detail = null; // wird im place-Block gesetzt, danach für Citizen-Code gebraucht
         if (type === 'stats_update') {
           rejectedDeltas.push({
             type: 'stats_update',
@@ -384,7 +388,7 @@ module.exports = function registerDeltasRoutes(deps) {
           }
 
           let tileMutationHandled = false;
-          let detail = itemDetailCache.get(tool);
+          detail = itemDetailCache.get(tool);
           if (typeof detail === 'undefined') {
             detail = await ensureItemDetailExists(tool, delta.metadata);
             itemDetailCache.set(tool, detail || null);
@@ -742,7 +746,7 @@ module.exports = function registerDeltasRoutes(deps) {
           }
         }
         version += 1;
-        await dbPool.query(
+        const [insertResult] = await dbPool.query(
           `INSERT INTO game_items
            (municipality_id, room_code, player_id, user_id, action_type, tool, zone_type, x, y, version, client_timestamp, applied_at, metadata)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -763,6 +767,31 @@ module.exports = function registerDeltasRoutes(deps) {
           ]
         );
         applied += 1;
+
+        // Citizen-Generierung: bei neuen Wohngebäuden Bürger einziehen lassen
+        if (persistedActionType === 'place' && detail) {
+          const cat = String(detail.category || '').toLowerCase();
+          const maxPop = Math.round(toFiniteNumber(detail.max_pop, 0));
+          if (cat === 'residential' && maxPop > 0) {
+            newResidentialBuildings.push({
+              buildingId: insertResult.insertId,
+              tool: String(persistedTool || '').toLowerCase(),
+              maxPop,
+            });
+          } else if (cat === 'commercial' || cat === 'industrial' || cat === 'infrastructure') {
+            needsJobAssignment = true;
+          }
+        }
+      }
+
+      // Bürger für neue Wohngebäude generieren + Jobs zuweisen (non-blocking, Fehler ignorieren)
+      if (newResidentialBuildings.length > 0 || needsJobAssignment) {
+        Promise.all([
+          ...newResidentialBuildings.map(b =>
+            generateCitizensForBuilding(b.buildingId, b.tool, municipality.id, b.maxPop).catch(() => {})
+          ),
+          needsJobAssignment ? assignJobsToCitizens(municipality.id).catch(() => {}) : Promise.resolve(),
+        ]).catch(() => {});
       }
 
       let newTreasury = null;

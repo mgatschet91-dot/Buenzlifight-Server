@@ -133,10 +133,10 @@ async function startRental(ownerUserId, tenantNickname, slug, tileX, tileY, room
     [municipalityId, safeRoomCode, safeTileX, safeTileY, safeOwner, tenantId, safeRent]
   );
 
-  // Population in game_items hochsetzen (Besitzer + Mieter)
+  // Population in game_items hochsetzen (Besitzer-Haushalt 3 + Mieter)
   await dbPool.query(
     `UPDATE game_items SET metadata = JSON_SET(COALESCE(metadata, '{}'), '$.population',
-      COALESCE(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.population')), 1) + 1)
+      COALESCE(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.population')), 3) + 1)
      WHERE municipality_id = ? AND room_code = ? AND x = ? AND y = ? AND tool = 'mansion' AND action_type = 'place'`,
     [municipalityId, safeRoomCode, safeTileX, safeTileY]
   );
@@ -171,12 +171,12 @@ async function endRental(agreementId, requestingUserId) {
     [safeId]
   );
 
-  // Population in game_items runtersetzen (mindestens 1 = Besitzer bleibt immer)
+  // Population in game_items runtersetzen (mindestens 3 = Besitzer-Haushalt bleibt immer)
   await dbPool.query(
     `UPDATE game_items gi
      JOIN mansion_rental_agreements mra ON mra.id = ?
      SET gi.metadata = JSON_SET(COALESCE(gi.metadata, '{}'), '$.population',
-       GREATEST(1, COALESCE(JSON_UNQUOTE(JSON_EXTRACT(gi.metadata, '$.population')), 1) - 1))
+       GREATEST(3, COALESCE(JSON_UNQUOTE(JSON_EXTRACT(gi.metadata, '$.population')), 3) - 1))
      WHERE gi.municipality_id = mra.municipality_id AND gi.room_code = mra.room_code
        AND gi.x = mra.tile_x AND gi.y = mra.tile_y AND gi.tool = 'mansion' AND gi.action_type = 'place'`,
     [safeId]

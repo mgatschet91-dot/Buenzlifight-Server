@@ -183,11 +183,11 @@ function getServerTargetLevelByElapsedHours(seedBase, elapsedHours) {
 // === Level-Progression: max ~7 Tage bis L5 ===
 function getSlowUpgradeHourRangeForLevel(fromLevel) {
   switch (Number(fromLevel)) {
-    case 1: return [6, 12];    // L1->L2: 6-12h
-    case 2: return [18, 30];   // L2->L3: 18-30h (~1 Tag)
-    case 3: return [42, 60];   // L3->L4: 42-60h (~2 Tage)
-    case 4: return [60, 66];   // L4->L5: 60-66h (~2.5 Tage)
-    default: return [168, 240];
+    case 1: return [18, 30];    // L1->L2: 18-30h  (~1 Tag)
+    case 2: return [54, 78];    // L2->L3: 54-78h  (~2-3 Tage)
+    case 3: return [108, 144];  // L3->L4: 108-144h (~4-6 Tage)
+    case 4: return [168, 216];  // L4->L5: 168-216h (~7-9 Tage)
+    default: return [240, 336];
   }
 }
 
@@ -220,9 +220,9 @@ function getServerTargetLevel(seedBase, elapsedHours, landValue, serviceCoverage
       break;
     }
   }
-  // Max-Level Cap: wie Original — LandValue + ServiceCoverage + Demand bestimmen das Ceiling.
-  // floor(lv/24 + svc/28 + demandBoost) → bei Standard (lv=50, svc=50) max L3, für L5 braucht es hohen LandValue UND gute Services.
-  const lvComponent  = Math.max(0, Math.min(200, landValue || 50)) / 24;
+  // Max-Level Cap: LandValue allein (Standard 50) erlaubt L3 (Mansion).
+  // Für L4/L5 werden zusätzlich Services und Demand benötigt.
+  const lvComponent  = Math.max(0, Math.min(200, landValue || 50)) / 15;
   const svcComponent = Math.max(0, Math.min(100, serviceCoverage || 0)) / 28;
   const demandBoost  = Math.max(0, ((zoneDemand || 0) - 30) / 70) * 0.7;
   const maxLevelByConditions = Math.min(5, Math.max(1, Math.floor(lvComponent + svcComponent + demandBoost)));
@@ -356,9 +356,12 @@ function findServerConsolidationFootprint(grid, x, y, width, height, zone, allow
           const tileRow = grid.get(key);
           const isOrigin = ox + dx === x && oy + dy === y;
           if (!tileRow) {
-            // Kein DB-Row = keine Zone gesetzt. Wie das Original:
-            // alle Tiles (auch Secondary) müssen in der richtigen Zone sein.
-            available = false; break;
+            // Kein DB-Row: könnte ein per auto-clear gelöschtes freies Zone-Tile sein.
+            // Nur den Origin-Tile (der aktuelle Kandidat) strikt fordern – alle anderen
+            // null-Tiles gelten als freie Grass-Tiles sofern sie nicht die Origin-Position sind.
+            if (isOrigin) { available = false; break; }
+            // Nicht-Origin null-Tiles: als freies Grass-Tile behandeln (kein Blockieren)
+            continue;
           }
           const tileMeta = toJsonValue(tileRow.metadata) || {};
           if (!isServerMergeableTile(tileRow, tileMeta, zone, isOrigin, allowBuildingConsolidation)) {
@@ -437,6 +440,22 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
       return canUpgradeTool(toolForUpgrade);
     });
     if (!candidates.length) return { updated: 0 };
+
+    // Vorberechnung: wie viele Mansions gibt es bereits, wie gross ist die Wohnzone?
+    let existingMansionCount = 0;
+    let residentialZoneTileCount = 0;
+    for (const r of rows) {
+      if (r.action_type === 'zone' && String(r.zone_type || '').toLowerCase() === 'residential') {
+        residentialZoneTileCount++;
+        const m = toJsonValue(r.metadata) || {};
+        const bt = String(metaValue(m, 'buildingType', 'building_type') || '').toLowerCase();
+        if (bt === 'mansion' && Number(metaValue(m, 'constructionProgress', 'construction_progress') ?? 0) >= 100) {
+          existingMansionCount++;
+        }
+      }
+    }
+    // 1 Mansion pro 40 Wohnzonen-Tiles erlaubt, mind. 1
+    const maxMansionsAllowed = Math.max(1, Math.floor(residentialZoneTileCount / 40));
 
     let currentVersion = await getRoomItemVersion(municipalityId, roomCode);
     const nowMs = Date.now();
@@ -654,17 +673,22 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
           } else {
             if (!roomGrid) roomGrid = buildRoomGrid(rows);
             const zoneDemandVal = Math.round(toFiniteNumber(demand[zoneCategory], 0));
-            let allowBuildingConsolidation = zoneDemandVal > 20;
-            let consolidationChance = 0.14;
+            let allowBuildingConsolidation = zoneDemandVal > 15;
+            let consolidationChance = 0.05;
             if (zoneDemandVal > 20) {
-              consolidationChance += Math.min(0.25, (zoneDemandVal - 20) / 300);
+              consolidationChance += Math.min(0.08, (zoneDemandVal - 20) / 400);
               if (zoneDemandVal > 50) {
-                consolidationChance += 0.05;
+                consolidationChance += 0.02;
                 allowBuildingConsolidation = true;
               }
             }
 
+            // Mansion-Cap: nicht mehr als maxMansionsAllowed in dieser Zone
+            if (targetEvolutionType === 'mansion' && existingMansionCount >= maxMansionsAllowed) {
+              // Cap erreicht — keine weitere Mansion
+            } else
             if (Math.random() < consolidationChance) {
+              if (targetEvolutionType === 'mansion') existingMansionCount++;
               const footprint = findServerConsolidationFootprint(
                 roomGrid,
                 Number(row.x),

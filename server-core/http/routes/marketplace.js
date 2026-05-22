@@ -295,7 +295,7 @@ module.exports = function registerMarketplaceRoutes(/* deps */) {
         if (!isSeller && !isBuyer) { await conn.rollback(); return sendJson(res, 403, { ok: false, error: 'Kein Zugriff' }); }
         await conn.query(`UPDATE energy_trade_contracts SET status = 'terminated', terminated_at = NOW() WHERE id = ?`, [contractId]);
         // MW zurückbuchen
-        if (isSeller || !isBuyer) {
+        if (isSeller) {
           await conn.query(`UPDATE municipality_stats SET energy_sold_mw = GREATEST(0, energy_sold_mw - ?) WHERE municipality_id = ?`, [contract.mw_amount, contract.seller_municipality_id]);
         }
         await conn.query(`UPDATE municipality_stats SET energy_bought_mw = GREATEST(0, energy_bought_mw - ?) WHERE municipality_id = ?`, [contract.mw_amount, contract.buyer_municipality_id]);
