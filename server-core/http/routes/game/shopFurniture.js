@@ -4,7 +4,7 @@ const { sendJson, readJsonBody } = require('../../../infra/http');
 const { dbPool, ensureDbEnabled } = require('../../../infra/db');
 const { getAuthenticatedUser } = require('../../../auth/middleware');
 
-module.exports = function registerShopFurnitureRoutes(_deps) {
+module.exports = function registerShopFurnitureRoutes(deps) {
   return async function handleShopFurniture(req, res, pathname /*, requestUrl */) {
 
     // GET /api/game/shop/furniture

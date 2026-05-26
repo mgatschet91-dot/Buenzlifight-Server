@@ -4,7 +4,7 @@ const { dbPool, ensureDbEnabled } = require('../infra/db.js');
 const { logError } = require('../infra/logger.js');
 const { applyMunicipalityTransaction } = require('./bank.js');
 const { applyStatChange } = require('./buenzli.js');
-const { calcCompanyLevel } = require('../http/routes/companies/helpers.js');
+const { calcCompanyLevel, calcWorkDuration } = require('../http/routes/companies/helpers.js');
 
 // ─── Schweizer NPC-Namen ──────────────────────────────────────
 const NPC_FIRST_NAMES = [
@@ -277,24 +277,86 @@ async function runNpcBotTick() {
     }
 
     // ── 2. Idle NPCs → offene Verträge zuweisen (Patrol-NPCs überspringen) ───
+    // Firmen mit ≥ 3 Mitgliedern werden übersprungen — echte Spieler sollen arbeiten
+    const NPC_AUTO_MEMBER_LIMIT = 3;
+
     const [idleBots] = await dbPool.query(
       `SELECT nb.id AS bot_id, nb.company_id, nb.bot_type, nb.efficiency, nb.xp_earned,
-              c.company_type_id
+              c.company_type_id, c.municipality_id AS company_municipality_id, c.level AS company_level,
+              ct.can_fix_categories, ct.code AS company_type_code,
+              (SELECT COUNT(*) FROM company_members cm WHERE cm.company_id = nb.company_id) AS member_count
        FROM npc_bots nb
        JOIN companies c ON c.id = nb.company_id
+       JOIN company_types ct ON ct.id = c.company_type_id
        WHERE nb.status = 'idle' AND nb.patrol_mode = 0`
     );
 
     for (const bot of idleBots) {
-      // Offenen Vertrag für diese Firma suchen
-      const [[contract]] = await dbPool.query(
-        `SELECT cc.id, cc.difficulty, cc.work_duration_seconds
-         FROM company_contracts cc
-         WHERE cc.company_id = ? AND cc.status = 'open'
-         ORDER BY cc.difficulty ASC
-         LIMIT 1`,
-        [bot.company_id]
-      );
+      // Genug echte Mitglieder vorhanden → NPC bleibt idle, Menschen sollen arbeiten
+      if ((bot.member_count || 0) >= NPC_AUTO_MEMBER_LIMIT) continue;
+      // Offenen Vertrag für diese Firma suchen — NUR passende Kategorien (Bug Fix)
+      const categories = (() => {
+        try { return JSON.parse(bot.can_fix_categories || '[]'); } catch { return []; }
+      })();
+
+      let contract = null;
+
+      if (categories.length > 0) {
+        const placeholders = categories.map(() => '?').join(',');
+        const [[row]] = await dbPool.query(
+          `SELECT cc.id, cc.difficulty, cc.work_duration_seconds
+           FROM company_contracts cc
+           JOIN municipality_events me ON me.id = cc.event_id
+           JOIN event_types et ON et.id = me.event_type_id
+           WHERE cc.company_id = ? AND cc.status = 'open'
+             AND et.category IN (${placeholders})
+           ORDER BY cc.difficulty ASC
+           LIMIT 1`,
+          [bot.company_id, ...categories]
+        );
+        contract = row || null;
+      }
+
+      // Kein offener Vertrag vorhanden → NPC erstellt selbst einen aus einem passenden Event
+      if (!contract && categories.length > 0 && bot.company_municipality_id) {
+        const placeholders = categories.map(() => '?').join(',');
+        const [[event]] = await dbPool.query(
+          `SELECT me.id, me.fix_cost, me.severity, me.municipality_id
+           FROM municipality_events me
+           JOIN event_types et ON et.id = me.event_type_id
+           LEFT JOIN company_contracts cc ON cc.event_id = me.id
+           WHERE me.municipality_id = ?
+             AND me.status IN ('detected','reported')
+             AND cc.id IS NULL
+             AND et.category IN (${placeholders})
+           ORDER BY me.severity DESC
+           LIMIT 1`,
+          [bot.company_municipality_id, ...categories]
+        );
+
+        if (event) {
+          const payment = event.fix_cost || event.severity * 500;
+          const deadlineHoursMap = { 1: 6, 2: 12, 3: 24, 4: 48, 5: 72 };
+          const deadline = new Date(Date.now() + (deadlineHoursMap[event.severity] || 24) * 3600000);
+          const xpReward = event.severity * 10;
+          const workDuration = calcWorkDuration(event.severity, bot.company_level || 1);
+
+          const [insertResult] = await dbPool.query(
+            `INSERT INTO company_contracts
+               (company_id, event_id, municipality_id, status, payment, difficulty, xp_reward, deadline_at, work_duration_seconds)
+             VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)`,
+            [bot.company_id, event.id, event.municipality_id, payment, event.severity, xpReward, deadline, workDuration]
+          );
+          await dbPool.query(
+            `UPDATE municipality_events
+             SET status = 'assigned', assigned_company_id = ?, updated_at = NOW()
+             WHERE id = ?`,
+            [bot.company_id, event.id]
+          );
+          contract = { id: insertResult.insertId, difficulty: event.severity, work_duration_seconds: workDuration };
+        }
+      }
+
       if (!contract) continue;
 
       // Vertrag annehmen und NPC zuweisen

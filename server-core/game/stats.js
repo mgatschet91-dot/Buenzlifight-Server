@@ -1003,6 +1003,31 @@ async function recomputeAuthoritativePopulationAndJobs(municipalityId, roomCode,
       }
     }
   }
+  // === Mansion Prestige-Spreading ===
+  // Fertiggebaute Mansions (place + zone) strahlen starken Bodenwert-Boost auf Nachbarn aus
+  const MANSION_PRESTIGE_RADIUS = 10;
+  for (const row of rows) {
+    if (row.action_type !== 'place' && row.action_type !== 'zone') continue;
+    const rMeta = toJsonValue(row.metadata) || {};
+    const rTool = row.action_type === 'place' ? String(row.tool || '') : String(metaValue(rMeta, 'buildingType', 'building_type') || '');
+    if (rTool.toLowerCase() !== 'mansion') continue;
+    const isBuilt = Number(metaValue(rMeta, 'constructionProgress', 'construction_progress') ?? 100) >= 100;
+    if (!isBuilt) continue;
+    const mx = Math.round(Number(row.x));
+    const my = Math.round(Number(row.y));
+    if (mx < 0 || my < 0 || mx >= gridSize || my >= gridSize) continue;
+    for (let ny = my - MANSION_PRESTIGE_RADIUS; ny <= my + MANSION_PRESTIGE_RADIUS; ny++) {
+      for (let nx = mx - MANSION_PRESTIGE_RADIUS; nx <= mx + MANSION_PRESTIGE_RADIUS; nx++) {
+        if (nx === mx && ny === my) continue;
+        if (nx < 0 || ny < 0 || nx >= gridSize || ny >= gridSize) continue;
+        const dist = Math.sqrt((nx - mx) ** 2 + (ny - my) ** 2);
+        if (dist > MANSION_PRESTIGE_RADIUS) continue;
+        const falloff = 1 - dist / (MANSION_PRESTIGE_RADIUS + 1);
+        landValueGrid[ny][nx] = Math.min(200, landValueGrid[ny][nx] + Math.round(50 * falloff));
+      }
+    }
+  }
+
   // === Kostenlose Parkplätze: LandValue-Boost + Gewerbe-Attraktivitäts-Bonus ===
   // Radius 5 Tiles: +10 LandValue-Punkte pro freiem Parkfeld (max +25 pro Tile)
   // Gewerbe-Multiplikator: für jede 10 abgedeckte Tiles +0.5% auf Gebäude-Einkommen

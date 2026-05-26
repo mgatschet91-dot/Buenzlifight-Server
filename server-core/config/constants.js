@@ -95,7 +95,7 @@ const HARD_CODED_BUILDING_STATS = new Map([
   // Wohngebäude: Verbrauch per Formel (pop × Faktor × lvlFactor) – kein Base-Wert nötig
   ['house_small', { maxPop: 6, maxJobs: 0, pollution: 0, landValue: 10 }],
   ['house_medium', { maxPop: 14, maxJobs: 0, pollution: 0, landValue: 22 }],
-  ['mansion', { maxPop: 8, maxJobs: 0, pollution: 0, landValue: 60 }],
+  ['mansion', { maxPop: 8, maxJobs: 0, pollution: 0, landValue: 90 }],
   ['apartment_low', { maxPop: 120, maxJobs: 0, pollution: 2, landValue: 40 }],
   ['apartment_high', { maxPop: 260, maxJobs: 0, pollution: 3, landValue: 55 }],
   ['cabin_house', { maxPop: 4, maxJobs: 0, pollution: -3, landValue: 15 }],

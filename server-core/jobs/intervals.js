@@ -140,7 +140,14 @@ function registerIntervals(deps) {
   }, 5000));
 
   // 3) Authoritative stats + disaster + building upgrade broadcast (every 3s)
+  let _mainTickRunning = false;
   intervals.push(setInterval(async () => {
+    if (_mainTickRunning) {
+      logError('INTERVAL', '3s-Haupttick übersprungen — vorheriger Tick läuft noch (Server überlastet?)');
+      return;
+    }
+    _mainTickRunning = true;
+    const _tickStart = Date.now();
     try {
       const rooms = getRooms();
       const disasters = getDisasters();
@@ -331,12 +338,34 @@ function registerIntervals(deps) {
       }
     } catch (err) {
       logError('INTERVAL', 'Stats/disaster tick error', { error: err?.message });
+    } finally {
+      _mainTickRunning = false;
+      const elapsed = Date.now() - _tickStart;
+      if (elapsed > 2500) logError('INTERVAL', `3s-Haupttick zu langsam: ${elapsed}ms (Limit: 2500ms)`);
     }
   }, 3000));
 
   // 4a) Citizen happiness + migration tick (every 5 minutes)
-  // Backfill wird einmalig pro Gemeinde pro Server-Session ausgeführt
+  // Backfill wird einmalig pro Gemeinde ausgeführt — beim ersten Tick sofort
   const _citizenBackfilledMunicipalities = new Set();
+
+  // Backfill direkt beim Start für alle Gemeinden mit aktiven Spielern auslösen
+  // (läuft im Hintergrund, blockiert nicht den Start)
+  setTimeout(async () => {
+    try {
+      const rooms = getRooms();
+      const citizens = getCitizens();
+      const { dbPool } = require('../infra/db.js');
+      const [munis] = await dbPool.query(`SELECT id FROM municipalities WHERE is_active = 1 LIMIT 50`);
+      for (const m of munis) {
+        if (_citizenBackfilledMunicipalities.has(m.id)) continue;
+        _citizenBackfilledMunicipalities.add(m.id);
+        citizens.backfillCitizensForAllBuildings(m.id).catch(() => {});
+      }
+      void rooms; // suppress unused warning
+    } catch (_e) { /* ignorieren */ }
+  }, 5000); // 5s nach Start — DB ist dann sicher bereit
+
   intervals.push(setInterval(async () => {
     try {
       const rooms = getRooms();
@@ -827,6 +856,7 @@ function registerIntervals(deps) {
           await applyMunicipalityTransaction(row.municipality_id, {
             amount: earnings,
             type: 'income',
+            allowOverdraft: true, // Defizit → geht auf Schulden, wird nie still ignoriert
             meta: {
               days: Math.round(elapsedDays * 100) / 100,
               hours: elapsedHours,

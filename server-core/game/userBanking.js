@@ -278,6 +278,17 @@ async function creditUserBankAccount(userId, opts = {}) {
     );
 
     await conn.commit();
+
+    // Sofort per Socket an den User pushen
+    try {
+      const { wsUserSockets } = require('../ws/socketio/index');
+      const { wsEmitToUser } = require('../ws/socketio/helpers');
+      const { io: wsIo } = require('../ws/socketio/index');
+      if (wsIo && wsUserSockets) {
+        wsEmitToUser(wsIo, safeUserId, 'balance-update', { balance: nextBalance }, wsUserSockets);
+      }
+    } catch (_e) { /* non-critical */ }
+
     return {
       user_id: safeUserId,
       account_id: accountId,
@@ -363,6 +374,17 @@ async function debitUserBankAccount(userId, opts = {}) {
     );
 
     await conn.commit();
+
+    // Sofort per Socket an den User pushen — kein Extra-HTTP-Fetch nötig
+    try {
+      const { wsUserSockets } = require('../ws/socketio/index');
+      const { wsEmitToUser } = require('../ws/socketio/helpers');
+      const { io: wsIo } = require('../ws/socketio/index');
+      if (wsIo && wsUserSockets) {
+        wsEmitToUser(wsIo, safeUserId, 'balance-update', { balance: nextBalance }, wsUserSockets);
+      }
+    } catch (_e) { /* non-critical — WS nicht verfügbar */ }
+
     return {
       user_id: safeUserId,
       account_id: accountId,

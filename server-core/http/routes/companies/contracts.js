@@ -416,6 +416,7 @@ module.exports = function registerContractRoutes(deps) {
 
       const [rows] = await dbPool.query(
         `SELECT me.id, me.severity, me.fix_cost, me.location_x, me.location_y, me.status,
+                me.expires_at,
                 et.name, et.emoji, et.category, et.code
          FROM municipality_events me
          JOIN event_types et ON et.id = me.event_type_id

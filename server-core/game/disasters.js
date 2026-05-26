@@ -454,8 +454,8 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
         }
       }
     }
-    // 1 Mansion pro 40 Wohnzonen-Tiles erlaubt, mind. 1
-    const maxMansionsAllowed = Math.max(1, Math.floor(residentialZoneTileCount / 40));
+    // Mansions sind extrem selten: global max 5, frühestens ab 60 Wohnzonen-Tiles
+    const maxMansionsAllowed = residentialZoneTileCount < 60 ? 1 : Math.min(5, Math.max(2, Math.floor(residentialZoneTileCount / 120)));
 
     let currentVersion = await getRoomItemVersion(municipalityId, roomCode);
     const nowMs = Date.now();
@@ -624,6 +624,17 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
       const currentAbandonedAfterTick = Boolean(nextMeta.abandoned === true);
       const toolForUpgrade = getUpgradeToolFromRow(row, meta);
 
+      // Bodenwert + Service-Coverage – im aeusseren Scope damit beide Bloecke (Upgrade + Evolution) darauf zugreifen koennen
+      const tileX = Math.round(Number(row.x || 0));
+      const tileY = Math.round(Number(row.y || 0));
+      const tileLandValue = context?.landValueGrid?.[tileY]?.[tileX] ?? 50;
+      const tileSvcCoverage = context?.serviceCoverageGrids
+        ? ((context.serviceCoverageGrids.police?.[tileY]?.[tileX] || 0) +
+           (context.serviceCoverageGrids.fire?.[tileY]?.[tileX] || 0) +
+           (context.serviceCoverageGrids.health?.[tileY]?.[tileX] || 0) +
+           (context.serviceCoverageGrids.education?.[tileY]?.[tileX] || 0)) / 4
+        : 0;
+
       if (!currentAbandonedAfterTick && isEconomicZone && !SERVICE_UPGRADE_TOOLS.has(toolForUpgrade)) {
         // Kein Level-Upgrade ohne Strom UND Wasser
         if (!hasPower || !hasWater) {
@@ -635,16 +646,6 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
           if (Number.isFinite(startedAtMsLevel) && startedAtMsLevel > 0) {
             const elapsedHours = Math.max(0, (nowMs - startedAtMsLevel) / (1000 * 60 * 60));
             const seedBase = `${municipalityId}:${roomCode}:${row.x}:${row.y}:${toolForUpgrade}`;
-            // Bodenwert + Service-Coverage vom context (berechnet in stats.js)
-            const tileX = Math.round(Number(row.x || 0));
-            const tileY = Math.round(Number(row.y || 0));
-            const tileLandValue = context?.landValueGrid?.[tileY]?.[tileX] ?? 50;
-            const tileSvcCoverage = context?.serviceCoverageGrids
-              ? ((context.serviceCoverageGrids.police?.[tileY]?.[tileX] || 0) +
-                 (context.serviceCoverageGrids.fire?.[tileY]?.[tileX] || 0) +
-                 (context.serviceCoverageGrids.health?.[tileY]?.[tileX] || 0) +
-                 (context.serviceCoverageGrids.education?.[tileY]?.[tileX] || 0)) / 4
-              : 0;
             const zoneDemandVal = Math.round(toFiniteNumber(demand[zoneCategory], 0));
             const targetLevel = getServerTargetLevel(seedBase, elapsedHours, tileLandValue, tileSvcCoverage, zoneDemandVal);
             if (targetLevel > currentLevel) {
@@ -683,18 +684,56 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
               }
             }
 
-            // Mansion-Cap: nicht mehr als maxMansionsAllowed in dieser Zone
-            if (targetEvolutionType === 'mansion' && existingMansionCount >= maxMansionsAllowed) {
-              // Cap erreicht — keine weitere Mansion
-            } else
-            if (Math.random() < consolidationChance) {
-              if (targetEvolutionType === 'mansion') existingMansionCount++;
+            // Mansion: Qualitätsbedingungen + Cluster-Logik + Cap
+            let effectiveConsolidationChance = consolidationChance;
+            let mansionBlocked = false;
+            if (targetEvolutionType === 'mansion') {
+              if (existingMansionCount >= maxMansionsAllowed) {
+                mansionBlocked = true;
+              } else {
+                // Nur bei wirklich guten Werten spawnen
+                const qualityOk = tileLandValue >= 90 && tileSvcCoverage >= 65 && zoneDemandVal >= 20;
+                if (!qualityOk) {
+                  mansionBlocked = true;
+                } else {
+                  // Prüfen ob bereits eine Mansion in der Nähe ist (Radius 8) → Cluster möglich
+                  const CLUSTER_RADIUS = 8;
+                  const CLUSTER_MAX = 3;
+                  let nearbyMansionCount = 0;
+                  for (const r2 of rows) {
+                    if (r2.action_type !== 'zone') continue;
+                    const m2 = toJsonValue(r2.metadata) || {};
+                    if (String(metaValue(m2, 'buildingType', 'building_type') || '').toLowerCase() !== 'mansion') continue;
+                    if (Number(metaValue(m2, 'constructionProgress', 'construction_progress') ?? 0) < 100) continue;
+                    const d = Math.abs(Number(r2.x) - tileX) + Math.abs(Number(r2.y) - tileY);
+                    if (d <= CLUSTER_RADIUS) nearbyMansionCount++;
+                  }
+                  const clusterFull = nearbyMansionCount >= CLUSTER_MAX;
+                  if (clusterFull) {
+                    mansionBlocked = true;
+                  } else {
+                    // Basis ~0.4-1%, bei nahem Cluster mit Topwerten bis 2.5%
+                    const hasNearby = nearbyMansionCount > 0;
+                    const prestigeBoost = hasNearby && tileLandValue >= 110 && tileSvcCoverage >= 80 ? 2.5 : 1.0;
+                    effectiveConsolidationChance = Math.min(0.025, consolidationChance * 0.08 * prestigeBoost);
+                  }
+                }
+              }
+            }
+            // Mansion geblockt → apartment_low als Fallback (Zone nicht stuck lassen)
+            const fallbackEvolutionType = mansionBlocked ? getTargetBuildingTypeForLevel(zoneCategory, 4) : null;
+            const activeEvolutionType = mansionBlocked ? fallbackEvolutionType : targetEvolutionType;
+            const activeTargetSize = activeEvolutionType ? getServerBuildingSize(activeEvolutionType) : targetSize;
+            const activeChance = mansionBlocked ? consolidationChance : effectiveConsolidationChance;
+
+            if (activeEvolutionType && Math.random() < activeChance) {
+              if (activeEvolutionType === 'mansion') existingMansionCount++;
               const footprint = findServerConsolidationFootprint(
                 roomGrid,
                 Number(row.x),
                 Number(row.y),
-                targetSize.width,
-                targetSize.height,
+                activeTargetSize.width,
+                activeTargetSize.height,
                 zoneCategory,
                 allowBuildingConsolidation
               );
@@ -703,8 +742,10 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
                 const ox = footprint.originX;
                 const oy = footprint.originY;
 
-                for (let dy = 0; dy < targetSize.height; dy++) {
-                  for (let dx = 0; dx < targetSize.width; dx++) {
+                // Level für Fallback-Evolution (apartment_low = Level 4)
+                const activeEvolLevel = (mansionBlocked && activeEvolutionType !== 'mansion') ? Math.max(4, evolLevel) : evolLevel;
+                for (let dy = 0; dy < activeTargetSize.height; dy++) {
+                  for (let dx = 0; dx < activeTargetSize.width; dx++) {
                     const tx = ox + dx;
                     const ty = oy + dy;
                     const isOrigin = dx === 0 && dy === 0;
@@ -716,25 +757,25 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
 
                     if (isOrigin) {
                       if (isCurrentRow) {
-                        nextMeta.buildingType = targetEvolutionType;
-                        nextMeta.level = evolLevel;
+                        nextMeta.buildingType = activeEvolutionType;
+                        nextMeta.level = activeEvolLevel;
                         nextMeta.constructionStartedAt = nowMs;
                         nextMeta.constructionProgress = 0;
                         nextMeta.constructed = false;
                         nextMeta.abandoned = false;
-                        nextMeta.footprintWidth = targetSize.width;
-                        nextMeta.footprintHeight = targetSize.height;
+                        nextMeta.footprintWidth = activeTargetSize.width;
+                        nextMeta.footprintHeight = activeTargetSize.height;
                       } else {
                         if (!tileRow) continue;
                         const originMeta = { ...(toJsonValue(tileRow.metadata) || {}) };
-                        originMeta.buildingType = targetEvolutionType;
-                        originMeta.level = evolLevel;
+                        originMeta.buildingType = activeEvolutionType;
+                        originMeta.level = activeEvolLevel;
                         originMeta.constructionStartedAt = nowMs;
                         originMeta.constructionProgress = 0;
                         originMeta.constructed = false;
                         originMeta.abandoned = false;
-                        originMeta.footprintWidth = targetSize.width;
-                        originMeta.footprintHeight = targetSize.height;
+                        originMeta.footprintWidth = activeTargetSize.width;
+                        originMeta.footprintHeight = activeTargetSize.height;
                         currentVersion += 1;
                         await dbPool.query(
                           `UPDATE game_items SET metadata = ?, version = ?, client_timestamp = ?, applied_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -744,13 +785,13 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
                         changedTiles.push({
                           x: tx,
                           y: ty,
-                          level: evolLevel,
+                          level: activeEvolLevel,
                           abandoned: false,
-                          buildingType: targetEvolutionType,
+                          buildingType: activeEvolutionType,
                           constructionProgress: 0,
                           constructed: false,
-                          footprintWidth: targetSize.width,
-                          footprintHeight: targetSize.height,
+                          footprintWidth: activeTargetSize.width,
+                          footprintHeight: activeTargetSize.height,
                         });
                       }
                     } else {
@@ -817,10 +858,10 @@ async function runServerBuildingUpgradeTick(municipalityId, roomCode, sharedRows
                     const existingGridRow = roomGrid.get(tk);
                     if (isOrigin) {
                       const snapMeta = isCurrentRow ? { ...nextMeta } : {
-                        buildingType: targetEvolutionType,
-                        footprintWidth: targetSize.width,
-                        footprintHeight: targetSize.height,
-                        level: evolLevel,
+                        buildingType: activeEvolutionType,
+                        footprintWidth: activeTargetSize.width,
+                        footprintHeight: activeTargetSize.height,
+                        level: activeEvolLevel,
                         constructed: false,
                         constructionProgress: 0,
                       };

@@ -2,7 +2,7 @@
 
 const { sendJson, readJsonBody } = require('../../../infra/http');
 const { logError } = require('../../../infra/logger');
-const { ensureDbEnabled } = require('../../../infra/db');
+const { dbPool, ensureDbEnabled } = require('../../../infra/db');
 const { getAuthenticatedUser } = require('../../../auth/middleware');
 const { getUserMunicipalityRole } = require('../../../game/municipality');
 const {

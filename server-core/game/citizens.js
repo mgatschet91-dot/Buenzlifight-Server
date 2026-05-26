@@ -2,6 +2,7 @@
 
 const { dbPool, ensureDbEnabled } = require('../infra/db.js');
 const { logError } = require('../infra/logger.js');
+const { HARD_CODED_BUILDING_STATS } = require('../config/constants.js');
 
 // ─── Nationalitäten-Verteilung (realistisch Schweiz) ──────────────────────
 // Kumulierte Schwellenwerte für schnelles Lookup (0–99)
@@ -19,14 +20,39 @@ const NATIONALITY_THRESHOLDS = [
   { id: 10, upTo: 99 }, // Andere          5%
 ];
 
+// ─── Start-Happiness nach Gebäudetyp ─────────────────────────────────────
+const START_HAPPINESS_BY_BUILDING = {
+  // Luxus
+  mansion:    85,
+  villa:      80,
+  penthouse:  80,
+  loft:       75,
+  condo:      75,
+  // Einfamilienhaus
+  house:      70,
+  bungalow:   70,
+  duplex:     70,
+  // Standard Mehrfamilienhaus
+  apartment:  65,
+  apartment_high: 70,
+  mehrfamilienhaus: 65,
+  flat:       65,
+  // Günstige Blöcke / Low-End
+  apartment_low: 58,
+  apartment_block: 55,
+  wohnblock:  55,
+};
+
 // ─── Education-Verteilung nach Gebäudetyp ─────────────────────────────────
 // Kumulierte Schwellenwerte: [edu=0, edu=1, edu=2, edu=3]
 const EDUCATION_BY_BUILDING = {
   // Günstige Wohnblöcke
   apartment_block:     [60, 90, 99, 100],
   wohnblock:           [60, 90, 99, 100],
+  apartment_low:       [40, 80, 97, 100],  // günstige Wohnungen
   // Standard Mehrfamilienhäuser
   apartment:           [20, 60, 90, 100],
+  apartment_high:      [10, 40, 80, 100],  // gehobene Wohnungen
   mehrfamilienhaus:    [20, 60, 90, 100],
   flat:                [20, 60, 90, 100],
   // Einfamilienhäuser
@@ -34,6 +60,7 @@ const EDUCATION_BY_BUILDING = {
   bungalow:            [5,  30, 75, 100],
   duplex:              [5,  30, 75, 100],
   // Gehoben
+  mansion:             [0,   5, 25, 100],
   villa:               [0,  10, 40, 100],
   penthouse:           [0,  10, 40, 100],
   loft:                [0,  15, 50, 100],
@@ -202,7 +229,7 @@ async function generateCitizensForBuilding(buildingId, tool, municipalityId, max
         c.education,
         buildingId,
         null,       // workplace_id: wird via assignJobsToCitizens gesetzt
-        70,         // happiness default
+        (START_HAPPINESS_BY_BUILDING[tool] ?? 70), // happiness nach Gebäudetyp
         c.has_car,
         municipalityId, // origin = aktuelle Gemeinde
         null,
@@ -285,11 +312,11 @@ async function assignJobsToCitizens(municipalityId) {
 async function runCitizenHappinessTick(municipalityId, crimeRate = 0) {
   ensureDbEnabled();
   try {
-    // Arbeitslose: -3 Happiness
+    // Arbeitslose: -3 Happiness (CAST verhindert UNSIGNED-Overflow bei 0)
     await dbPool.query(
       `UPDATE citizens
-       SET happiness = GREATEST(0, happiness - 3)
-       WHERE municipality_id = ? AND workplace_id IS NULL AND happiness > 0`,
+       SET happiness = GREATEST(0, CAST(happiness AS SIGNED) - 3)
+       WHERE municipality_id = ? AND workplace_id IS NULL`,
       [municipalityId]
     );
 
@@ -297,8 +324,8 @@ async function runCitizenHappinessTick(municipalityId, crimeRate = 0) {
     if (crimeRate > 0.5) {
       await dbPool.query(
         `UPDATE citizens
-         SET happiness = GREATEST(0, happiness - 2)
-         WHERE municipality_id = ? AND happiness > 0`,
+         SET happiness = GREATEST(0, CAST(happiness AS SIGNED) - 2)
+         WHERE municipality_id = ?`,
         [municipalityId]
       );
     }
@@ -307,7 +334,7 @@ async function runCitizenHappinessTick(municipalityId, crimeRate = 0) {
     if (crimeRate < 0.3) {
       await dbPool.query(
         `UPDATE citizens
-         SET happiness = LEAST(100, happiness + 1)
+         SET happiness = LEAST(100, CAST(happiness AS SIGNED) + 1)
          WHERE municipality_id = ? AND workplace_id IS NOT NULL`,
         [municipalityId]
       );
@@ -430,12 +457,18 @@ async function getActiveCitizensForBroadcast(municipalityId, hour) {
 // Wird einmal pro Gemeinde beim Server-Start ausgeführt.
 // Generiert Bürger für alle Wohngebäude ohne Bewohner, dann weist Jobs zu.
 
+// Wohngebäude-Typen die aus Zonen entstehen können
+const RESIDENTIAL_ZONE_TYPES = new Set([
+  'house_small', 'house_medium', 'mansion',
+  'apartment_low', 'apartment_high', 'cabin_house',
+]);
+
 async function backfillCitizensForAllBuildings(municipalityId) {
   ensureDbEnabled();
   try {
-    // Alle Wohngebäude der Gemeinde holen
-    const [residentialBuildings] = await dbPool.query(
-      `SELECT gi.id AS building_id, gi.tool, COALESCE(gid.max_population, 4) AS max_pop
+    // 1) Direkt platzierte Wohngebäude (action_type = 'place')
+    const [placedBuildings] = await dbPool.query(
+      `SELECT gi.id AS building_id, gi.tool
        FROM game_items gi
        LEFT JOIN game_item_details gid ON gi.tool = gid.tool
        WHERE gi.municipality_id = ?
@@ -443,6 +476,27 @@ async function backfillCitizensForAllBuildings(municipalityId) {
          AND gid.category = 'residential'`,
       [municipalityId]
     );
+
+    // 2) Zone-evolved Wohngebäude (action_type = 'zone', buildingType in metadata)
+    const [zoneBuildings] = await dbPool.query(
+      `SELECT id AS building_id,
+              JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.buildingType')) AS tool
+       FROM game_items
+       WHERE municipality_id = ?
+         AND action_type = 'zone'
+         AND JSON_EXTRACT(metadata, '$.buildingType') IS NOT NULL`,
+      [municipalityId]
+    );
+    const residentialZoneBuildings = zoneBuildings.filter(
+      b => b.tool && RESIDENTIAL_ZONE_TYPES.has(b.tool)
+    );
+
+    const residentialBuildings = [...placedBuildings, ...residentialZoneBuildings];
+
+    // max_pop aus HARD_CODED_BUILDING_STATS ermitteln
+    residentialBuildings.forEach(b => {
+      b.max_pop = HARD_CODED_BUILDING_STATS.get(b.tool)?.maxPop ?? 4;
+    });
     if (!residentialBuildings.length) return;
 
     // Bereits belegte Gebäude ausfiltern (eine Query statt N)
