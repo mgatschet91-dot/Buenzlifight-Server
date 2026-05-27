@@ -2230,6 +2230,82 @@ async function triggerManualDisaster(municipalityId, roomCode, disasterType, raw
   };
 }
 
+// ─── Traffic Accident In-Memory State ──────────────────────────────────────
+const _trafficAccidentState = new Map(); // lockKey → { accidents, nextId, lastSpawnTick, tickCount }
+
+const ACCIDENT_CONFIG = {
+  spawnCooldownTicks: 1200, // min. 1h zwischen Unfällen (1200 × 3s = 3600s)
+  spawnChance: 0.15,        // 15% pro Tick nach Cooldown
+  durationTicks: 40,        // 2 Minuten bis Auto-Auflösung (40 × 3s = 120s)
+  maxAccidents: 1,
+  // Kosten bei Unfall (Rettungskräfte, Sachschaden)
+  costLeicht: 350,          // CHF Gemeindekasse
+  costSchwer: 800,
+};
+
+async function runServerTrafficAccidentTick(municipalityId, roomCode, sharedRows) {
+  const lockKey = `${municipalityId}:${normalizeRoomCode(roomCode)}`;
+
+  if (!_trafficAccidentState.has(lockKey)) {
+    _trafficAccidentState.set(lockKey, { accidents: new Map(), nextId: 1, lastSpawnTick: -999, tickCount: 0 });
+  }
+  const roomState = _trafficAccidentState.get(lockKey);
+  roomState.tickCount++;
+
+  const newAccidents = [];
+  const resolvedAccidents = [];
+
+  // Bestehende Unfälle herunterzählen
+  for (const [id, acc] of roomState.accidents.entries()) {
+    acc.ticksAlive++;
+    if (acc.ticksAlive >= ACCIDENT_CONFIG.durationTicks) {
+      roomState.accidents.delete(id);
+      resolvedAccidents.push({ id, x: acc.x, y: acc.y });
+    }
+  }
+
+  // Neuen Unfall spawnen?
+  const cooldownOk = (roomState.tickCount - roomState.lastSpawnTick) >= ACCIDENT_CONFIG.spawnCooldownTicks;
+  const belowMax = roomState.accidents.size < ACCIDENT_CONFIG.maxAccidents;
+  if (cooldownOk && belowMax && Math.random() < ACCIDENT_CONFIG.spawnChance) {
+    const roadTiles = [];
+    for (const row of sharedRows) {
+      const t = String(row.tool || '').toLowerCase();
+      if (t === 'road' || t === 'bridge') roadTiles.push({ x: Number(row.x), y: Number(row.y) });
+    }
+    if (roadTiles.length > 0) {
+      const tile = roadTiles[Math.floor(Math.random() * roadTiles.length)];
+      const id = roomState.nextId++;
+      const severity = Math.random() < 0.25 ? 'schwer' : 'leicht';
+      const cost = severity === 'schwer' ? ACCIDENT_CONFIG.costSchwer : ACCIDENT_CONFIG.costLeicht;
+      roomState.accidents.set(id, { id, x: tile.x, y: tile.y, ticksAlive: 0, severity, cost });
+      roomState.lastSpawnTick = roomState.tickCount;
+      newAccidents.push({ id, x: tile.x, y: tile.y, severity, cost });
+      // Kosten direkt aus Gemeindekasse abziehen
+      try {
+        const { applyMunicipalityTransaction } = require('./bank.js');
+        await applyMunicipalityTransaction(municipalityId, {
+          amount: -cost,
+          type: 'accident_cost',
+          description: `Verkehrsunfall (${severity}): Rettungseinsatz & Bergung`,
+          allowOverdraft: true,
+          source: 'system',
+        });
+      } catch (_) { /* nicht blockieren */ }
+    }
+  }
+
+  return {
+    accidents: Array.from(roomState.accidents.values()),
+    newAccidents,
+    resolvedAccidents,
+  };
+}
+
+function clearTrafficAccidentState(municipalityId, roomCode) {
+  _trafficAccidentState.delete(`${municipalityId}:${normalizeRoomCode(roomCode)}`);
+}
+
 module.exports = {
   canBurnTool,
   isFireStationTool,
@@ -2257,4 +2333,6 @@ module.exports = {
   clearCrimeState,
   runServerDisasterTick,
   triggerManualDisaster,
+  runServerTrafficAccidentTick,
+  clearTrafficAccidentState,
 };

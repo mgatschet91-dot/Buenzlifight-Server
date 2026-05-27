@@ -221,6 +221,21 @@ function registerIntervals(deps) {
               });
             }
 
+            // Traffic Accident Tick
+            try {
+              const accidentResult = await disasters.runServerTrafficAccidentTick(municipalityId, roomCode, sharedRows);
+              if (io && (accidentResult.newAccidents.length > 0 || accidentResult.resolvedAccidents.length > 0 || accidentResult.accidents.length > 0)) {
+                io.to(roomKey).emit('traffic-accident-authoritative', {
+                  accidents: accidentResult.accidents,
+                  newAccidents: accidentResult.newAccidents,
+                  resolvedAccidents: accidentResult.resolvedAccidents,
+                  serverTimestamp: Date.now(),
+                });
+              }
+            } catch (accErr) {
+              logError('INTERVAL', `Traffic accident tick error for ${key}`, { error: accErr?.message });
+            }
+
             // Crime-NPCs broadcasten (Gangster-Positionen + Events + Homeless-Count)
             const hasActiveCrime = crimeResult && (crimeResult.criminals?.length > 0 || crimeResult.crimeEvents?.length > 0);
             const homelessCount = crimeResult?.homeless || 0;
