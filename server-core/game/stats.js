@@ -16,6 +16,20 @@ const {
 
 const ECONOMY_LOG_FILE = path.join(__dirname, '..', 'logs', 'economy.log');
 
+// Kurzzeit-Caches für DB-Abfragen die sich selten ändern
+const _werkhofNpcCache   = new Map(); // municipalityId → { count, ts }
+const _busLineCache      = new Map(); // municipalityId → { reduction, ts }
+const _partnerCache      = new Map(); // municipalityId → { hasPartner, ts }
+const _parkingCache      = new Map(); // municipalityId → { rows, ts }
+const _companyTaxCache   = new Map(); // municipalityId → { total, ts }
+const _muniStaticCache   = new Map(); // municipalityId → { energy+stats fields, ts }
+const WERKHOF_TTL  = 30_000; // 30s
+const BUSLINE_TTL  = 60_000; // 60s
+const PARTNER_TTL  = 60_000; // 60s
+const PARKING_TTL  = 60_000; // 60s
+const COMPANY_TAX_TTL = 30_000; // 30s
+const MUNI_STATIC_TTL = 10_000; // 10s (energy_sold/bought, stats, social fields)
+
 
 async function appendEconomyLog(entry) {
   try {
@@ -58,18 +72,24 @@ async function recomputeAuthoritativePopulationAndJobs(municipalityId, roomCode,
   const isWinter = currentMonth === 12 || currentMonth <= 2;
   const isSummer = currentMonth >= 6 && currentMonth <= 8;
 
-  // Werkhof-NPC-Anzahl vorab laden (beeinflusst Gebäude-Condition-Erholung im Building-Loop)
+  // Werkhof-NPC-Anzahl: gecacht 30s (JOIN-Query, ändert sich selten)
   let _werkhofNpcCount = 0;
   try {
-    const [_werkhofNpcRows] = await dbPool.query(
-      `SELECT COUNT(nb.id) AS npc_count
-       FROM companies c
-       JOIN company_types ct ON ct.id = c.company_type_id
-       LEFT JOIN npc_bots nb ON nb.company_id = c.id AND nb.status != 'fired' AND nb.patrol_mode = 1
-       WHERE c.municipality_id = ? AND ct.code = 'werkhof' AND c.is_active = 1`,
-      [municipalityId]
-    );
-    _werkhofNpcCount = Number(_werkhofNpcRows[0]?.npc_count || 0);
+    const _wc = _werkhofNpcCache.get(municipalityId);
+    if (_wc && (Date.now() - _wc.ts) < WERKHOF_TTL) {
+      _werkhofNpcCount = _wc.count;
+    } else {
+      const [_werkhofNpcRows] = await dbPool.query(
+        `SELECT COUNT(nb.id) AS npc_count
+         FROM companies c
+         JOIN company_types ct ON ct.id = c.company_type_id
+         LEFT JOIN npc_bots nb ON nb.company_id = c.id AND nb.status != 'fired' AND nb.patrol_mode = 1
+         WHERE c.municipality_id = ? AND ct.code = 'werkhof' AND c.is_active = 1`,
+        [municipalityId]
+      );
+      _werkhofNpcCount = Number(_werkhofNpcRows[0]?.npc_count || 0);
+      _werkhofNpcCache.set(municipalityId, { count: _werkhofNpcCount, ts: Date.now() });
+    }
   } catch (_) {}
 
   let population = 0;
@@ -559,14 +579,69 @@ async function recomputeAuthoritativePopulationAndJobs(municipalityId, roomCode,
   let powerBalance = powerProduction - powerConsumption;
   const waterRawBalance = waterProduction - waterConsumption;
 
-  // === Wasserspeicher: Füllstand verwalten ===
+  // === municipality_stats: ALLE benötigten Felder in EINEM Query laden ===
+  // (fasst die ehemaligen 3 separaten Reads auf water_storage, energy und stats-Felder zusammen)
   let waterStorageLevel = 0;
+  let powerSoldMw = 0;
+  let powerBoughtMw = 0;
+  let powerBufferPct = 10;
+  let muniStatBonus = { security: 0, attractiveness: 0, cleanliness: 0, infrastructure: 0, transparency: 0 };
+  let muniStatRaw = { security: 50, attractiveness: 50, cleanliness: 50, infrastructure: 50, transparency: 50 };
+  let socialFund = 0;
+  let socialContributionRate = 5;
+  let welfarePerUnemployed = 8;
   try {
+    // water_storage_level immer frisch (Simulationszustand), Rest aus Cache
     const [wsRows] = await dbPool.query(
-      `SELECT water_storage_level FROM municipality_stats WHERE municipality_id = ? LIMIT 1`,
+      `SELECT water_storage_level, energy_sold_mw, energy_bought_mw, power_buffer_pct,
+              security, attractiveness, cleanliness, infrastructure, transparency,
+              social_fund, social_contribution_rate, welfare_per_unemployed
+       FROM municipality_stats WHERE municipality_id = ? LIMIT 1`,
       [municipalityId]
     );
-    waterStorageLevel = Math.max(0, Number(wsRows[0]?.water_storage_level ?? 0));
+    if (wsRows[0]) {
+      const ms = wsRows[0];
+      waterStorageLevel = Math.max(0, Number(ms.water_storage_level ?? 0));
+      // Energy-Felder (auch gecacht für spätere Nutzung)
+      const _msc = _muniStaticCache.get(municipalityId);
+      if (!_msc || (Date.now() - _msc.ts) >= MUNI_STATIC_TTL) {
+        _muniStaticCache.set(municipalityId, {
+          ts: Date.now(),
+          energy_sold_mw:   Number(ms.energy_sold_mw   ?? 0),
+          energy_bought_mw: Number(ms.energy_bought_mw ?? 0),
+          power_buffer_pct: Number(ms.power_buffer_pct ?? 10),
+          security:     Number(ms.security     ?? 50),
+          attractiveness: Number(ms.attractiveness ?? 50),
+          cleanliness:  Number(ms.cleanliness  ?? 50),
+          infrastructure: Number(ms.infrastructure ?? 50),
+          transparency: Number(ms.transparency ?? 50),
+          social_fund:  Number(ms.social_fund  ?? 0),
+          social_contribution_rate: Number(ms.social_contribution_rate ?? 5),
+          welfare_per_unemployed:   Number(ms.welfare_per_unemployed   ?? 8),
+        });
+      }
+      const cached = _muniStaticCache.get(municipalityId);
+      powerSoldMw    = Math.max(0, cached.energy_sold_mw);
+      powerBoughtMw  = Math.max(0, cached.energy_bought_mw);
+      powerBufferPct = Math.max(1, Math.min(25, cached.power_buffer_pct));
+      muniStatRaw = {
+        security:       Math.max(0, Math.min(100, cached.security)),
+        attractiveness: Math.max(0, Math.min(100, cached.attractiveness)),
+        cleanliness:    Math.max(0, Math.min(100, cached.cleanliness)),
+        infrastructure: Math.max(0, Math.min(100, cached.infrastructure)),
+        transparency:   Math.max(0, Math.min(100, cached.transparency)),
+      };
+      muniStatBonus = {
+        security:       (cached.security       - 50) * 0.3,
+        attractiveness: (cached.attractiveness  - 50) * 0.3,
+        cleanliness:    (cached.cleanliness     - 50) * 0.3,
+        infrastructure: (cached.infrastructure  - 50) * 0.3,
+        transparency:   (cached.transparency    - 50) * 0.3,
+      };
+      socialFund               = cached.social_fund;
+      socialContributionRate   = Math.max(0, Math.min(15, cached.social_contribution_rate));
+      welfarePerUnemployed     = Math.max(0, Math.min(50, cached.welfare_per_unemployed));
+    }
   } catch (_) {}
 
   // Pro Tick 3s = 3/3600 h. Fülle/leere Speicher entsprechend
@@ -625,19 +700,24 @@ async function recomputeAuthoritativePopulationAndJobs(municipalityId, roomCode,
 
   const roadCount = rows.filter((r) => String(r.tool || '').toLowerCase() === 'road' && r.action_type === 'place').length;
 
-  // === Active bus lines congestion bonus ===
+  // === Active bus lines congestion bonus (gecacht 60s) ===
   let activeBusLineReduction = 0;
   try {
-    const [busLineRows] = await dbPool.query(
-      `SELECT COUNT(*) AS line_count, COALESCE(SUM(sub.stop_count), 0) AS total_stops
-       FROM bus_lines bl
-       JOIN (SELECT bus_line_id, COUNT(*) AS stop_count FROM bus_line_stops GROUP BY bus_line_id) sub ON sub.bus_line_id = bl.id
-       WHERE bl.municipality_id = ? AND bl.status = 'active'`,
-      [municipalityId]
-    );
-    if (busLineRows[0]) {
-      // Each active line reduces congestion by 30, plus 5 per stop
-      activeBusLineReduction = (busLineRows[0].line_count || 0) * 30 + (busLineRows[0].total_stops || 0) * 5;
+    const _bc = _busLineCache.get(municipalityId);
+    if (_bc && (Date.now() - _bc.ts) < BUSLINE_TTL) {
+      activeBusLineReduction = _bc.reduction;
+    } else {
+      const [busLineRows] = await dbPool.query(
+        `SELECT COUNT(*) AS line_count, COALESCE(SUM(sub.stop_count), 0) AS total_stops
+         FROM bus_lines bl
+         JOIN (SELECT bus_line_id, COUNT(*) AS stop_count FROM bus_line_stops GROUP BY bus_line_id) sub ON sub.bus_line_id = bl.id
+         WHERE bl.municipality_id = ? AND bl.status = 'active'`,
+        [municipalityId]
+      );
+      if (busLineRows[0]) {
+        activeBusLineReduction = (busLineRows[0].line_count || 0) * 30 + (busLineRows[0].total_stops || 0) * 5;
+      }
+      _busLineCache.set(municipalityId, { reduction: activeBusLineReduction, ts: Date.now() });
     }
   } catch (_) { /* table might not exist yet */ }
 
@@ -738,30 +818,24 @@ async function recomputeAuthoritativePopulationAndJobs(municipalityId, roomCode,
   let powerImportPricePerUnit = 2.0; // Fr. pro Einheit (Normaltarif)
   if (powerImportUnits > 0) {
     try {
-      const [partnerRows] = await dbPool.query(
-        `SELECT id FROM game_partnerships WHERE municipality_id = ? AND status = 'connected' LIMIT 1`,
-        [municipalityId]
-      );
-      if (partnerRows.length > 0) {
-        powerImportPricePerUnit = 1.6; // 20% Rabatt mit Partner
+      const _pc = _partnerCache.get(municipalityId);
+      let _hasPartner;
+      if (_pc && (Date.now() - _pc.ts) < PARTNER_TTL) {
+        _hasPartner = _pc.hasPartner;
+      } else {
+        const [partnerRows] = await dbPool.query(
+          `SELECT id FROM game_partnerships WHERE municipality_id = ? AND status = 'connected' LIMIT 1`,
+          [municipalityId]
+        );
+        _hasPartner = partnerRows.length > 0;
+        _partnerCache.set(municipalityId, { hasPartner: _hasPartner, ts: Date.now() });
       }
+      if (_hasPartner) powerImportPricePerUnit = 1.6;
     } catch (_) { /* kein Partner = Normaltarif */ }
   }
   const powerImportCost = Math.round(powerImportUnits * powerImportPricePerUnit);
 
-  // ── Strom-Handel: verkaufte MW abziehen, gekaufte MW addieren ─────────────
-  let powerSoldMw = 0;
-  let powerBoughtMw = 0;
-  let powerBufferPct = 10;
-  try {
-    const [msRows] = await dbPool.query(
-      `SELECT energy_sold_mw, energy_bought_mw, power_buffer_pct FROM municipality_stats WHERE municipality_id = ? LIMIT 1`,
-      [municipalityId]
-    );
-    powerSoldMw    = Math.max(0, Number(msRows[0]?.energy_sold_mw    ?? 0));
-    powerBoughtMw  = Math.max(0, Number(msRows[0]?.energy_bought_mw  ?? 0));
-    powerBufferPct = Math.max(1, Math.min(25, Number(msRows[0]?.power_buffer_pct ?? 10)));
-  } catch (_) {}
+  // ── Strom-Handel: Werte bereits oben aus kombiniertem municipality_stats-Read geladen ──
   // Gekaufte MW zur Produktion addieren
   powerProduction += powerBoughtMw;
   // Effektive Produktion nach Abzug verkaufter MW
@@ -905,35 +979,8 @@ async function recomputeAuthoritativePopulationAndJobs(municipalityId, roomCode,
     ? Math.min(1, educationCapacityTotal / educationDemand)
     : (schoolCount + universityCount > 0 ? 1 : 0);
 
-  let muniStatBonus = { security: 0, attractiveness: 0, cleanliness: 0, infrastructure: 0, transparency: 0 };
-  let muniStatRaw = { security: 50, attractiveness: 50, cleanliness: 50, infrastructure: 50, transparency: 50 };
-  let socialFund = 0;
-  let socialContributionRate = 5; // Default 5%
-  let welfarePerUnemployed = 8;  // Default 8 CHF/Tag
-  try {
-    const [muniRows] = await dbPool.query(
-      `SELECT security, attractiveness, cleanliness, infrastructure, transparency,
-              social_fund, social_contribution_rate, welfare_per_unemployed
-       FROM municipality_stats WHERE municipality_id = ?`,
-      [municipalityId]
-    );
-    if (muniRows.length > 0) {
-      const ms = muniRows[0];
-      muniStatRaw.security = Math.max(0, Math.min(100, Number(ms.security ?? 50)));
-      muniStatRaw.attractiveness = Math.max(0, Math.min(100, Number(ms.attractiveness ?? 50)));
-      muniStatRaw.cleanliness = Math.max(0, Math.min(100, Number(ms.cleanliness ?? 50)));
-      muniStatRaw.infrastructure = Math.max(0, Math.min(100, Number(ms.infrastructure ?? 50)));
-      muniStatRaw.transparency = Math.max(0, Math.min(100, Number(ms.transparency ?? 50)));
-      muniStatBonus.security = ((ms.security || 50) - 50) * 0.3;
-      muniStatBonus.attractiveness = ((ms.attractiveness || 50) - 50) * 0.3;
-      muniStatBonus.cleanliness = ((ms.cleanliness || 50) - 50) * 0.3;
-      muniStatBonus.infrastructure = ((ms.infrastructure || 50) - 50) * 0.3;
-      muniStatBonus.transparency = ((ms.transparency || 50) - 50) * 0.3;
-      socialFund = Number(ms.social_fund ?? 0);
-      socialContributionRate = Math.max(0, Math.min(15, Number(ms.social_contribution_rate ?? 5)));
-      welfarePerUnemployed = Math.max(0, Math.min(50, Number(ms.welfare_per_unemployed ?? 8)));
-    }
-  } catch (_) {}
+  // muniStatBonus, muniStatRaw, socialFund, socialContributionRate, welfarePerUnemployed
+  // → bereits oben aus kombiniertem municipality_stats-Read geladen
 
   // Slider-Werte aus game_stats-Blob überschreiben municipality_stats (sind aktueller)
   if (typeof rawStats.social_contribution_rate !== 'undefined') {
@@ -1035,10 +1082,18 @@ async function recomputeAuthoritativePopulationAndJobs(municipalityId, roomCode,
   const freeParkingGrid = Array.from({ length: gridSize }, () => new Uint8Array(gridSize)); // 1 = free parking
   let freeParkingCommercialBonus = 1.0;
   try {
-    const [freeParkRows] = await dbPool.query(
-      `SELECT tile_x, tile_y FROM parking_config WHERE municipality_id = ? AND is_free = 1`,
-      [municipalityId]
-    );
+    const _pkc = _parkingCache.get(municipalityId);
+    let freeParkRows;
+    if (_pkc && (Date.now() - _pkc.ts) < PARKING_TTL) {
+      freeParkRows = _pkc.rows;
+    } else {
+      const [_rows] = await dbPool.query(
+        `SELECT tile_x, tile_y FROM parking_config WHERE municipality_id = ? AND is_free = 1`,
+        [municipalityId]
+      );
+      freeParkRows = _rows;
+      _parkingCache.set(municipalityId, { rows: freeParkRows, ts: Date.now() });
+    }
     if (freeParkRows.length > 0) {
       // Grid markieren + Spreading für LandValue
       for (const fp of freeParkRows) {
@@ -1202,12 +1257,18 @@ async function recomputeAuthoritativePopulationAndJobs(municipalityId, roomCode,
 
   let businessTaxIncome = 0;
   try {
-    const [[ctRow]] = await dbPool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total FROM municipality_ledger
-       WHERE municipality_id = ? AND type = 'company_tax' AND ts >= DATE_SUB(NOW(), INTERVAL 1 DAY)`,
-      [municipalityId]
-    );
-    businessTaxIncome = Math.max(0, Math.round(Number(ctRow?.total) || 0));
+    const _ctc = _companyTaxCache.get(municipalityId);
+    if (_ctc && (Date.now() - _ctc.ts) < COMPANY_TAX_TTL) {
+      businessTaxIncome = _ctc.total;
+    } else {
+      const [[ctRow]] = await dbPool.query(
+        `SELECT COALESCE(SUM(amount), 0) AS total FROM municipality_ledger
+         WHERE municipality_id = ? AND type = 'company_tax' AND ts >= DATE_SUB(NOW(), INTERVAL 1 DAY)`,
+        [municipalityId]
+      );
+      businessTaxIncome = Math.max(0, Math.round(Number(ctRow?.total) || 0));
+      _companyTaxCache.set(municipalityId, { total: businessTaxIncome, ts: Date.now() });
+    }
   } catch (_) {}
 
   // Firmensteuer: reale Buchungen + serverseitiger Baseline-Fallback für stabile 10-25% im Normalzustand.

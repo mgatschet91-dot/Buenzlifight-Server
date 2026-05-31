@@ -21,6 +21,24 @@ const {
   STEAM_WEB_API_KEY, STEAM_APP_ID,
 } = require('../../config/constants');
 
+// Steam Avatar URL via GetPlayerSummaries holen (best-effort, kein throw bei Fehler)
+function fetchSteamAvatarUrl(steamId) {
+  return new Promise((resolve) => {
+    const url = `https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=${STEAM_WEB_API_KEY}&steamids=${steamId}`;
+    https.get(url, res => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const player = json?.response?.players?.[0];
+          resolve(player?.avatarmedium || player?.avatar || null);
+        } catch { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+  });
+}
+
 function verifySteamTicket(ticket) {
   return new Promise((resolve, reject) => {
     const url = `https://api.steampowered.com/ISteamUserAuth/AuthenticateUserTicket/v1/?key=${STEAM_WEB_API_KEY}&appid=${STEAM_APP_ID}&ticket=${ticket}`;
@@ -368,7 +386,7 @@ module.exports = function registerAuthRoutes(deps) {
       ensureDbEnabled();
       const user = await getAuthenticatedUser(req);
       if (!user) return sendJson(res, 401, { ok: false, error: 'Nicht angemeldet' });
-      const body = await readBody(req);
+      const body = await readJsonBody(req);
       const newNickname = (body.nickname || '').toString().trim();
       if (newNickname.length < 2 || newNickname.length > 32) return sendJson(res, 422, { ok: false, error: 'Nickname muss 2-32 Zeichen haben' });
       if (!/^[a-zA-Z0-9_\-. äöüÄÖÜ]+$/.test(newNickname)) return sendJson(res, 422, { ok: false, error: 'Ungültige Zeichen im Nickname' });
@@ -400,6 +418,151 @@ module.exports = function registerAuthRoutes(deps) {
         [user.id]
       );
       return sendJson(res, 200, { ok: true, history: rows });
+    }
+
+    // ── Gemeinde verlassen ────────────────────────────────────────────────────
+    if (req.method === 'POST' && pathname === '/api/auth/leave-municipality') {
+      ensureDbEnabled();
+      const user = await getAuthenticatedUser(req);
+      if (!user) return sendJson(res, 401, { ok: false, error: 'Nicht angemeldet' });
+      if (!user.municipality_id) return sendJson(res, 422, { ok: false, error: 'Du bist in keiner Gemeinde' });
+      const muniId = user.municipality_id;
+      // Ownership-Check
+      const [[membership]] = await dbPool.query(
+        'SELECT role FROM municipality_memberships WHERE user_id = ? AND municipality_id = ? LIMIT 1',
+        [user.id, muniId]
+      );
+      if (membership?.role === MUNICIPALITY_ROLE_OWNER) {
+        // Gibt es andere Mitglieder? → Ownership übertragen
+        const [[nextMember]] = await dbPool.query(
+          'SELECT user_id FROM municipality_memberships WHERE municipality_id = ? AND user_id != ? LIMIT 1',
+          [muniId, user.id]
+        );
+        if (nextMember) {
+          await dbPool.query('UPDATE companies SET owner_id = ? WHERE owner_id = ? AND municipality_id = ?', [nextMember.user_id, user.id, muniId]).catch(() => {});
+          await dbPool.query(
+            'UPDATE municipality_memberships SET role = ? WHERE municipality_id = ? AND user_id = ?',
+            [MUNICIPALITY_ROLE_OWNER, muniId, nextMember.user_id]
+          );
+        }
+      }
+      // Aus Gemeinde austreten
+      await dbPool.query('DELETE FROM municipality_memberships WHERE user_id = ? AND municipality_id = ?', [user.id, muniId]);
+      await dbPool.query('UPDATE users SET municipality_id = NULL WHERE id = ?', [user.id]);
+      // Letzter Bewohner? → Gemeinde deaktivieren
+      const [[cnt]] = await dbPool.query(
+        'SELECT COUNT(*) AS c FROM users WHERE municipality_id = ? AND is_active = 1',
+        [muniId]
+      );
+      if (Number(cnt.c) === 0) {
+        await dbPool.query('UPDATE municipalities SET is_active = 0 WHERE id = ?', [muniId]);
+      }
+      logInfo('AUTH', `Gemeinde verlassen: ${user.nickname} (ID ${user.id}) aus Gemeinde ${muniId}`);
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // ── Gemeinde wählen (nach Kick oder fehlender Mitgliedschaft) ────────────
+    if (req.method === 'POST' && pathname === '/api/auth/join-municipality') {
+      ensureDbEnabled();
+      const user = await getAuthenticatedUser(req);
+      if (!user) return sendJson(res, 401, { ok: false, error: 'Nicht angemeldet' });
+      const body = await readJsonBody(req);
+      const municipalitySlug = (body.municipalitySlug || '').toString().trim();
+      const municipalityId   = Number(body.municipalityId) || 0;
+      const newMunicipalityName = (body.newMunicipalityName || '').toString().trim().slice(0, 100);
+      let muni = null;
+      let role = MUNICIPALITY_ROLE_CITIZEN;
+      if (newMunicipalityName && newMunicipalityName.length >= 2) {
+        const slug = newMunicipalityName
+          .toLowerCase()
+          .replace(/[äàâ]/g, 'ae').replace(/[öòô]/g, 'oe').replace(/[üùû]/g, 'ue')
+          .replace(/[éèêë]/g, 'e').replace(/[íìîï]/g, 'i').replace(/[ß]/g, 'ss')
+          .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        const [[slugTaken]] = await dbPool.query('SELECT id FROM municipalities WHERE slug = ? LIMIT 1', [slug]);
+        if (slugTaken) return sendJson(res, 409, { ok: false, error: 'Eine Gemeinde mit diesem Namen existiert bereits' });
+        const [ins] = await dbPool.query(
+          `INSERT INTO municipalities (name, slug, canton_code, canton_name, is_active, is_user_created) VALUES (?, ?, '', '', 1, 1)`,
+          [newMunicipalityName, slug]
+        );
+        await dbPool.query(
+          `INSERT IGNORE INTO municipality_stats (municipality_id, shield_active_until, treasury) VALUES (?, DATE_ADD(NOW(), INTERVAL 7 DAY), 15000)`,
+          [ins.insertId]
+        );
+        muni = { id: ins.insertId, slug, name: newMunicipalityName };
+        role = MUNICIPALITY_ROLE_OWNER;
+      } else if (municipalityId || municipalitySlug) {
+        const [[bySlug]] = municipalityId
+          ? await dbPool.query('SELECT id, slug, name FROM municipalities WHERE id = ? LIMIT 1', [municipalityId])
+          : await dbPool.query('SELECT id, slug, name FROM municipalities WHERE slug = ? LIMIT 1', [municipalitySlug]);
+        if (!bySlug) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+        // Kick-Ban prüfen
+        const [[ban]] = await dbPool.query(
+          'SELECT id FROM municipality_kick_bans WHERE municipality_id = ? AND user_id = ? LIMIT 1',
+          [bySlug.id, user.id]
+        );
+        if (ban) return sendJson(res, 403, { ok: false, error: 'Du wurdest aus dieser Gemeinde entfernt und kannst nicht selbst wieder beitreten.' });
+        const [[cnt]] = await dbPool.query('SELECT COUNT(*) AS c FROM users WHERE municipality_id = ? AND is_active = 1', [bySlug.id]);
+        if (Number(cnt.c) >= MUNICIPALITY_MEMBER_LIMIT) return sendJson(res, 409, { ok: false, error: 'Gemeinde ist voll' });
+        muni = bySlug;
+      } else {
+        return sendJson(res, 422, { ok: false, error: 'Gemeinde oder neuer Name erforderlich' });
+      }
+      await dbPool.query(
+        `INSERT INTO municipality_memberships (municipality_id, user_id, role) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE role = VALUES(role)`,
+        [muni.id, user.id, role]
+      );
+      await dbPool.query('UPDATE users SET municipality_id = ? WHERE id = ?', [muni.id, user.id]);
+      await dbPool.query('UPDATE municipalities SET is_active = 1 WHERE id = ? AND is_active = 0', [muni.id]);
+      await syncMunicipalityMemberships(muni.id);
+      logInfo('AUTH', `Gemeinde-Beitritt nach Kick: ${user.nickname} → ${muni.slug}`);
+      return sendJson(res, 200, { ok: true, municipality: { id: muni.id, slug: muni.slug, name: muni.name } });
+    }
+
+    // ── Account löschen ──────────────────────────────────────────────────────
+    if (req.method === 'POST' && pathname === '/api/auth/delete-account') {
+      ensureDbEnabled();
+      const user = await getAuthenticatedUser(req);
+      if (!user) return sendJson(res, 401, { ok: false, error: 'Nicht angemeldet' });
+      const uid = user.id;
+
+      // Firmen: Ownership übergeben oder löschen
+      const [ownedCompanies] = await dbPool.query('SELECT id FROM companies WHERE owner_id = ?', [uid]);
+      for (const company of ownedCompanies) {
+        const [[nextMember]] = await dbPool.query(
+          'SELECT user_id FROM company_members WHERE company_id = ? AND user_id != ? LIMIT 1',
+          [company.id, uid]
+        );
+        if (nextMember) {
+          await dbPool.query('UPDATE companies SET owner_id = ? WHERE id = ?', [nextMember.user_id, company.id]);
+        } else {
+          await dbPool.query('DELETE FROM companies WHERE id = ?', [company.id]);
+        }
+      }
+
+      // Gemeinde deaktivieren falls der User der letzte Bewohner war
+      if (user.municipality_id) {
+        const [[memberCount]] = await dbPool.query(
+          'SELECT COUNT(*) AS cnt FROM users WHERE municipality_id = ? AND id != ? AND is_active = 1',
+          [user.municipality_id, uid]
+        );
+        if (Number(memberCount?.cnt) === 0) {
+          await dbPool.query('UPDATE municipalities SET is_active = 0 WHERE id = ?', [user.municipality_id]);
+        }
+      }
+
+      // Freundesliste beidseitig leeren (auch wenn CASCADE greift — explizit für Klarheit)
+      await dbPool.query('DELETE FROM user_friends WHERE user_id = ? OR friend_id = ?', [uid, uid]);
+      await dbPool.query('DELETE FROM user_friend_requests WHERE sender_id = ? OR receiver_id = ?', [uid, uid]);
+
+      // Blockierende Einträge ohne CASCADE vorher entfernen
+      await dbPool.query('DELETE FROM energy_spot_offers WHERE seller_user_id = ?', [uid]);
+      await dbPool.query('DELETE FROM mansion_rental_agreements WHERE owner_id = ? OR tenant_id = ?', [uid, uid]);
+
+      // User löschen — Gemeinde und deren Gebäude bleiben unangetastet
+      // Alle CASCADE-Tabellen (sessions, memberships, xp, bank, ...) folgen automatisch
+      await dbPool.query('DELETE FROM users WHERE id = ?', [uid]);
+      logInfo('AUTH', `Account gelöscht: ${user.nickname} (ID ${uid})`);
+      return sendJson(res, 200, { ok: true });
     }
 
     // ── Steam-Login / Auto-Register ──────────────────────────────────────────
@@ -435,6 +598,10 @@ module.exports = function registerAuthRoutes(deps) {
           return sendJson(res, 200, { ok: false, newUser: true, isExisting: true, setupToken, steamName: existing.nickname });
         }
         await revokeAllUserSessions(existing.id);
+        // Avatar aktualisieren (best-effort, kein Fehler wenn Steam API nicht antwortet)
+        fetchSteamAvatarUrl(steamId).then(avatarUrl => {
+          if (avatarUrl) dbPool.query('UPDATE users SET steam_avatar_url = ? WHERE id = ?', [avatarUrl, existing.id]).catch(() => {});
+        }).catch(() => {});
         const token = signToken({ sub: existing.id, email: existing.email || '', nickname: existing.nickname, rem: 1 }, TOKEN_TTL_HOURS_REMEMBER);
         await createAuthSession(existing.id, token, req, TOKEN_TTL_HOURS_REMEMBER);
         logInfo('AUTH', `Steam-Login: ${existing.nickname} (ID ${existing.id}, Steam ${steamId})`);
@@ -509,6 +676,8 @@ module.exports = function registerAuthRoutes(deps) {
             [muni.id, userId, role]
           );
           await dbPool.query('UPDATE users SET municipality_id = ? WHERE id = ?', [muni.id, userId]);
+          // Gemeinde reaktivieren falls sie leer/deaktiviert war
+          await dbPool.query('UPDATE municipalities SET is_active = 1 WHERE id = ? AND is_active = 0', [muni.id]);
           await syncMunicipalityMemberships(muni.id);
         }
         return muni;
@@ -553,6 +722,11 @@ module.exports = function registerAuthRoutes(deps) {
         logInfo('AUTH', `Steam-Setup (new): ${username} (ID ${userId}, Steam ${steamId}, Gemeinde: ${muni?.slug || 'keine'})`);
       }
 
+      // Avatar holen und speichern (best-effort)
+      fetchSteamAvatarUrl(steamId).then(avatarUrl => {
+        if (avatarUrl) dbPool.query('UPDATE users SET steam_avatar_url = ? WHERE id = ?', [avatarUrl, userId]).catch(() => {});
+      }).catch(() => {});
+
       await revokeAllUserSessions(userId);
       const token = signToken({ sub: userId, email: userEmail, nickname: username, rem: 1 }, TOKEN_TTL_HOURS_REMEMBER);
       await createAuthSession(userId, token, req, TOKEN_TTL_HOURS_REMEMBER);
@@ -563,7 +737,7 @@ module.exports = function registerAuthRoutes(deps) {
       ensureDbEnabled();
       const user = await getAuthenticatedUser(req);
       if (!user) return sendJson(res, 401, { ok: false, error: 'Nicht angemeldet' });
-      const body = await readBody(req);
+      const body = await readJsonBody(req);
       const oldPassword = (body.old_password || '').toString();
       const newPassword = (body.new_password || '').toString();
       if (!oldPassword || !newPassword) return sendJson(res, 422, { ok: false, error: 'Altes und neues Passwort erforderlich' });

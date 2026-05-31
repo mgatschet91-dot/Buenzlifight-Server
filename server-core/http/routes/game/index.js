@@ -26,6 +26,7 @@ const registerRoomNpcRoutes = require('./roomNpcs');
 const registerRoomModerationRoutes = require('./roomModeration');
 const registerNavigatorHousesRoute = require('./navigatorHouses');
 const registerBuildingResidentsRoutes = require('./buildingResidents');
+const registerWarRoutes = require('./war');
 
 module.exports = function registerGameRoutes(deps) {
   const subHandlers = [
@@ -48,6 +49,7 @@ module.exports = function registerGameRoutes(deps) {
     registerRoomNpcRoutes(deps),
     registerRoomModerationRoutes(deps),
     registerNavigatorHousesRoute(deps),
+    registerWarRoutes(deps),
   ];
 
   const handleInspections = registerInspectionsRoutes(deps);

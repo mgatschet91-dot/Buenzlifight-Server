@@ -341,9 +341,12 @@ async function expireBuenzliEvents(io = null) {
     } catch (_) {}
   }
 
+  // Alle blockierten Status ebenfalls expiren — sonst zählen sie ewig gegen den Cap
+  // (investigating/assigned ohne Contract, external_reported ohne Deadline-Verarbeitung)
   const [result] = await dbPool.query(
     `UPDATE municipality_events SET status = 'expired', updated_at = NOW()
-     WHERE status IN ('detected','reported') AND expires_at <= NOW()`
+     WHERE status IN ('detected','reported','investigating','assigned','external_reported')
+       AND expires_at <= NOW()`
   );
   const expired = result.affectedRows || 0;
   if (expired > 0) {
@@ -965,7 +968,7 @@ async function resolveBuenzliEvent(eventId, userId, opts = {}) {
     xp: xpResult,
     cost: event.fix_cost,
     building: buildingCheck?.building || null,
-    coins: { user: coinsUser, user_balance: newUserCoins },
+    coins: { user: 0, user_balance: newUserCoins },
   };
 }
 

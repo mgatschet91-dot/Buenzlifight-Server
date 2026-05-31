@@ -297,6 +297,14 @@ async function seedBuildingStatsToDb() {
   return { seeded };
 }
 
+// Modul-Level-Cache: alle game_item_details (ändert sich nur bei Admin-Eingriffen)
+const _itemDetailsAllCache = new Map(); // key: cantonCode|'__all__' → { list, cachedAt }
+const ITEM_DETAILS_ALL_TTL = 5 * 60 * 1000; // 5 Minuten
+
+function invalidateItemDetailsCache() {
+  _itemDetailsAllCache.clear();
+}
+
 async function fetchItemDetails(tool, cantonCode = null) {
   ensureDbEnabled();
   const fallbackItemDetails = {
@@ -336,6 +344,12 @@ async function fetchItemDetails(tool, cantonCode = null) {
     if (row) return row;
     return fallbackItemDetails[tool] || null;
   }
+  const cacheKey = cantonCode ? `canton:${cantonCode}` : '__all__';
+  const cached = _itemDetailsAllCache.get(cacheKey);
+  if (cached && (Date.now() - cached.cachedAt) < ITEM_DETAILS_ALL_TTL) {
+    return cached.list;
+  }
+
   let rows;
   try {
     if (cantonCode) {
@@ -360,6 +374,7 @@ async function fetchItemDetails(tool, cantonCode = null) {
       list.push(fallback);
     }
   }
+  _itemDetailsAllCache.set(cacheKey, { list, cachedAt: Date.now() });
   return list;
 }
 
@@ -491,6 +506,7 @@ module.exports = {
   seedGameItemDetailsFromClientHardcodedData,
   seedBuildingStatsToDb,
   fetchItemDetails,
+  invalidateItemDetailsCache,
   ensureItemDetailExists,
   fetchItemCatalogVersion,
   fetchCatalogPages,

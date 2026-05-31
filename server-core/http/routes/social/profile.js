@@ -132,7 +132,8 @@ module.exports = function registerProfileRoutes(deps) {
       if (type === 'players') {
         const [rows] = await dbPool.query(
           `SELECT u.id, u.nickname, m.name AS municipality_name,
-                  COALESCE(ux.total_xp, 0) AS xp, COALESCE(ux.level, 1) AS level
+                  COALESCE(ux.total_xp, 0) AS xp, COALESCE(ux.level, 1) AS level,
+                  u.steam_id, u.steam_avatar_url
            FROM users u
            LEFT JOIN user_xp ux ON ux.user_id = u.id
            LEFT JOIN municipalities m ON m.id = u.municipality_id
@@ -209,7 +210,8 @@ module.exports = function registerProfileRoutes(deps) {
         `SELECT u.id, u.nickname, u.municipality_id, u.created_at,
                 COALESCE(u.motto, '') AS motto,
                 m.name AS municipality_name, m.slug AS municipality_slug,
-                COALESCE(ux.total_xp, 0) AS xp, COALESCE(ux.level, 1) AS level
+                COALESCE(ux.total_xp, 0) AS xp, COALESCE(ux.level, 1) AS level,
+                u.steam_id, u.steam_avatar_url
          FROM users u
          LEFT JOIN municipalities m ON m.id = u.municipality_id
          LEFT JOIN user_xp ux ON ux.user_id = u.id

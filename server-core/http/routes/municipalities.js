@@ -5,6 +5,8 @@ const path = require('path');
 const { sendJson, readJsonBody } = require('../../infra/http');
 const { dbPool, ensureDbEnabled } = require('../../infra/db');
 const { getAuthenticatedUser } = require('../../auth/middleware');
+const { wsEmitToUser } = require('../../ws/socketio/helpers');
+const { wsUserSockets } = require('../../ws/socketio/index');
 const {
   municipalityRoleRank,
   normalizeMunicipalityRole,
@@ -50,6 +52,9 @@ const {
   castVote,
   openNoConfidenceVote,
   voteNoConfidence,
+  getActivePetition,
+  openPetition,
+  signPetition,
 } = require('../../game/municipality');
 const { createOrGetRoom, updateRoomState } = require('../../game/rooms');
 
@@ -490,6 +495,22 @@ module.exports = function registerMunicipalityRoutes(deps) {
         [targetUserId, municipality.id]
       );
 
+      // Kick-Ban eintragen → User kann nicht selbst wieder beitreten
+      await dbPool.query(
+        `INSERT INTO municipality_kick_bans (municipality_id, user_id, banned_by)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE banned_at = NOW(), banned_by = VALUES(banned_by)`,
+        [municipality.id, targetUserId, authUser.id]
+      );
+
+      // Gekickten User per Socket benachrichtigen
+      if (deps?.io) {
+        wsEmitToUser(deps.io, targetUserId, 'municipality-kicked', {
+          reason: `Du wurdest aus der Gemeinde "${municipality.name}" entfernt.`,
+          municipalityName: municipality.name,
+        }, wsUserSockets);
+      }
+
       return sendJson(res, 200, { ok: true, data: { removed: true, user_id: targetUserId } });
     }
 
@@ -525,6 +546,12 @@ module.exports = function registerMunicipalityRoutes(deps) {
       if (memberCount[0].cnt >= MUNICIPALITY_MEMBER_LIMIT) {
         return sendJson(res, 400, { ok: false, error: `Gemeinde ist voll (${MUNICIPALITY_MEMBER_LIMIT} Mitglieder max.)` });
       }
+
+      // Kick-Ban aufheben (Owner lädt explizit ein → Ban wird gelöscht)
+      await dbPool.query(
+        'DELETE FROM municipality_kick_bans WHERE municipality_id = ? AND user_id = ?',
+        [municipality.id, targetUserId]
+      );
 
       // User in Gemeinde aufnehmen
       await dbPool.query(`UPDATE users SET municipality_id = ? WHERE id = ?`, [municipality.id, targetUserId]);
@@ -752,6 +779,85 @@ module.exports = function registerMunicipalityRoutes(deps) {
       } catch (err) {
         if (err.message === 'ALREADY_VOTED') return sendJson(res, 400, { ok: false, error: 'Du hast bereits abgestimmt' });
         throw err;
+      }
+    }
+
+    // ── Bürger-Petition ───────────────────────────────────────────────────────
+
+    // GET /api/game/municipality/:slug/petition — aktuelle Petition laden
+    const petitionMatch = pathname.match(/^\/api\/game\/municipality\/([a-z0-9-]+)\/petition$/i);
+    if (petitionMatch && req.method === 'GET') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const municipality = await getMunicipalityBySlug(petitionMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      const petition = await getActivePetition(municipality.id);
+      if (!petition) return sendJson(res, 200, { ok: true, data: null });
+
+      // Hat der User bereits unterschrieben?
+      const [sigRows] = await dbPool.query(
+        `SELECT id FROM municipality_petition_signatures WHERE petition_id = ? AND user_id = ? LIMIT 1`,
+        [petition.id, authUser.id]
+      );
+      return sendJson(res, 200, {
+        ok: true,
+        data: {
+          id: petition.id,
+          status: petition.status,
+          signatures_count: Number(petition.signature_count || 0),
+          signatures_needed: Number(petition.signatures_needed || 0),
+          expires_at: petition.expires_at,
+          created_at: petition.created_at,
+          has_signed: sigRows.length > 0,
+        },
+      });
+    }
+
+    // POST /api/game/municipality/:slug/petition — Petition starten (jeder Citizen/Council)
+    if (petitionMatch && req.method === 'POST') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const municipality = await getMunicipalityBySlug(petitionMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      try {
+        const result = await openPetition(municipality.id, authUser.id);
+        return sendJson(res, 200, { ok: true, data: result });
+      } catch (err) {
+        const msgs = {
+          NOT_A_MEMBER: 'Du bist kein Mitglied dieser Gemeinde',
+          OWNER_CANNOT_PETITION: 'Der Bürgermeister kann keine Petition gegen sich selbst starten',
+          PETITION_COOLDOWN: 'Du kannst erst in 30 Tagen wieder eine Petition starten',
+          PETITION_ALREADY_OPEN: 'Es läuft bereits eine Petition',
+          ELECTION_ALREADY_ACTIVE: 'Es läuft bereits eine Wahl',
+        };
+        return sendJson(res, 400, { ok: false, error: msgs[err.message] || err.message });
+      }
+    }
+
+    // POST /api/game/municipality/:slug/petition/:id/sign — Petition unterschreiben
+    const petitionSignMatch = pathname.match(/^\/api\/game\/municipality\/([a-z0-9-]+)\/petition\/([0-9]+)\/sign$/i);
+    if (petitionSignMatch && req.method === 'POST') {
+      ensureDbEnabled();
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) return sendJson(res, 401, { ok: false, error: 'Nicht authentifiziert' });
+      const municipality = await getMunicipalityBySlug(petitionSignMatch[1].toLowerCase());
+      if (!municipality) return sendJson(res, 404, { ok: false, error: 'Gemeinde nicht gefunden' });
+
+      const petitionId = Number(petitionSignMatch[2]);
+      try {
+        const result = await signPetition(petitionId, authUser.id, municipality.id);
+        return sendJson(res, 200, { ok: true, data: result });
+      } catch (err) {
+        const msgs = {
+          PETITION_NOT_FOUND: 'Petition nicht gefunden oder bereits abgeschlossen',
+          NOT_A_MEMBER: 'Du bist kein Mitglied dieser Gemeinde',
+          ALREADY_SIGNED: 'Du hast diese Petition bereits unterschrieben',
+        };
+        return sendJson(res, 400, { ok: false, error: msgs[err.message] || err.message });
       }
     }
 

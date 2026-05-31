@@ -498,6 +498,16 @@ async function manualKontrolle(tileX, tileY, slot, userId) {
 
     const municipalityId = membership.municipality_id;
 
+    // Sicherstellen dass der Parkplatz wirklich in der Gemeinde der Firma liegt
+    const [[parkingTile]] = await dbPool.query(
+      `SELECT id FROM game_items
+       WHERE municipality_id = ? AND tile_x = ? AND tile_y = ?
+         AND tool IN ('parking_spot','parking_lot','parking_lot_large')
+       LIMIT 1`,
+      [municipalityId, tileX, tileY]
+    );
+    if (!parkingTile) return { ok: false, error: 'Parkplatz gehört nicht zur Gemeinde deiner Firma' };
+
     // Offenen Verstoss auf diesem Slot suchen (in der Gemeinde der Firma)
     const [[violation]] = await dbPool.query(
       `SELECT id, fine_amount FROM parking_violations
